@@ -837,6 +837,69 @@ class TestDeliverResultWrapping:
         assert send_mock.call_args.kwargs["thread_id"] == "17585"
 
 
+class TestDeliverResultRetries:
+    """Standalone cron delivery retries transient send failures."""
+
+    @staticmethod
+    def _enabled_telegram_config():
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        return mock_cfg
+
+    @staticmethod
+    def _telegram_origin_job(job_id="retry-job"):
+        return {
+            "id": job_id,
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+    def test_standalone_delivery_retries_error_result_then_succeeds(self):
+        mock_cfg = self._enabled_telegram_config()
+        send_mock = AsyncMock(side_effect=[{"error": "rate limited"}, {"success": True}])
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "delivery_retry_attempts": 2, "delivery_retry_delay_seconds": 0}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler.time.sleep") as sleep_mock:
+            result = _deliver_result(self._telegram_origin_job(), "hello")
+
+        assert result is None
+        assert send_mock.call_count == 2
+        sleep_mock.assert_not_called()
+
+    def test_standalone_delivery_returns_last_error_after_retries_exhausted(self):
+        mock_cfg = self._enabled_telegram_config()
+        send_mock = AsyncMock(side_effect=[{"error": "rate limited once"}, {"error": "rate limited twice"}])
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "delivery_retry_attempts": 2, "delivery_retry_delay_seconds": 0}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler.time.sleep") as sleep_mock:
+            result = _deliver_result(self._telegram_origin_job(), "hello")
+
+        assert result == "delivery error: rate limited twice"
+        assert send_mock.call_count == 2
+        sleep_mock.assert_not_called()
+
+    def test_standalone_delivery_uses_configured_retry_delay(self):
+        mock_cfg = self._enabled_telegram_config()
+        send_mock = AsyncMock(side_effect=[{"error": "temporary"}, {"success": True}])
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False, "delivery_retry_attempts": 2, "delivery_retry_delay_seconds": 7}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler.time.sleep") as sleep_mock:
+            result = _deliver_result(self._telegram_origin_job(), "hello")
+
+        assert result is None
+        sleep_mock.assert_called_once_with(7)
+
+
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
 

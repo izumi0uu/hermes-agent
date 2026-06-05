@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -42,6 +43,29 @@ from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_DELIVERY_RETRY_ATTEMPTS = 2
+_DEFAULT_DELIVERY_RETRY_DELAY_SECONDS = 300
+
+
+def _resolve_delivery_retry_settings(user_cfg: Optional[dict]) -> tuple[int, int]:
+    """Resolve standalone cron delivery retry settings from config.
+
+    Delivery retries are intentionally limited to the standalone send path:
+    the live gateway adapter path already has direct runtime feedback and
+    fallback behavior.  Config values are clamped so invalid or hostile config
+    cannot disable all attempts or create negative sleeps.
+    """
+    retry_attempts = _DEFAULT_DELIVERY_RETRY_ATTEMPTS
+    retry_delay_seconds = _DEFAULT_DELIVERY_RETRY_DELAY_SECONDS
+    try:
+        cron_cfg = user_cfg.get("cron", {}) if isinstance(user_cfg, dict) else {}
+        retry_attempts = int(cron_cfg.get("delivery_retry_attempts", retry_attempts))
+        retry_delay_seconds = int(cron_cfg.get("delivery_retry_delay_seconds", retry_delay_seconds))
+    except Exception:
+        retry_attempts = _DEFAULT_DELIVERY_RETRY_ATTEMPTS
+        retry_delay_seconds = _DEFAULT_DELIVERY_RETRY_DELAY_SECONDS
+    return max(1, retry_attempts), max(0, retry_delay_seconds)
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -641,6 +665,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
     wrap_response = True
+    user_cfg = {}
     try:
         user_cfg = load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
@@ -673,6 +698,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     delivery_errors = []
+    retry_attempts, retry_delay_seconds = _resolve_delivery_retry_settings(user_cfg)
 
     for target in targets:
         platform_name = target["platform"]
@@ -778,32 +804,47 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
-            # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
-            try:
-                result = asyncio.run(coro)
-            except RuntimeError:
-                # asyncio.run() checks for a running loop before awaiting the coroutine;
-                # when it raises, the original coro was never started — close it to
-                # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
-                # fresh thread that has no running loop.
-                coro.close()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
-                    result = future.result(timeout=30)
-            except Exception as e:
-                msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
-                logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
-                continue
+            last_error = None
+            for attempt in range(1, retry_attempts + 1):
+                if attempt > 1:
+                    logger.info(
+                        "Job '%s': retrying delivery to %s:%s (attempt %s/%s)",
+                        job["id"], platform_name, chat_id, attempt, retry_attempts,
+                    )
 
-            if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
-                logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
-                continue
+                # Standalone path: run the async send in a fresh event loop (safe from any thread)
+                coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+                try:
+                    try:
+                        result = asyncio.run(coro)
+                    except RuntimeError:
+                        # asyncio.run() checks for a running loop before awaiting the coroutine;
+                        # when it raises, the original coro was never started — close it to
+                        # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
+                        # fresh thread that has no running loop.
+                        coro.close()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                            result = future.result(timeout=30)
+                except Exception as e:
+                    last_error = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                    logger.error("Job '%s': %s", job["id"], last_error)
+                else:
+                    if result and result.get("error"):
+                        last_error = f"delivery error: {result['error']}"
+                        logger.error("Job '%s': %s", job["id"], last_error)
+                    else:
+                        logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+                        delivered = True
+                        break
 
-            logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+                if attempt < retry_attempts and retry_delay_seconds:
+                    time.sleep(retry_delay_seconds)
+
+            if not delivered:
+                if last_error:
+                    delivery_errors.append(last_error)
+                continue
 
     if delivery_errors:
         return "; ".join(delivery_errors)
