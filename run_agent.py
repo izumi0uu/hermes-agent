@@ -2967,8 +2967,31 @@ class AIAgent:
             # Explicitly read proxy settings while still honoring NO_PROXY for
             # loopback / local endpoints such as a locally hosted sub2api.
             _proxy = _get_proxy_for_base_url(base_url)
+            _transport = _httpx.HTTPTransport(socket_options=_sock_opts)
+            if (
+                base_url_host_matches(str(base_url or ""), "tcdmx.com")
+                or base_url_host_matches(str(base_url or ""), "api.clawto.link")
+            ):
+                class _RelayHeaderTransport(_httpx.BaseTransport):
+                    def __init__(self, inner):
+                        self._inner = inner
+
+                    def handle_request(self, request):
+                        # Some OpenAI-compatible relays reject the OpenAI
+                        # Python SDK's X-Stainless telemetry headers.
+                        for name in list(request.headers.keys()):
+                            lname = name.lower()
+                            if lname.startswith("x-stainless-") or lname == "user-agent":
+                                request.headers.pop(name, None)
+                        request.headers["User-Agent"] = "curl/8.7.1"
+                        return self._inner.handle_request(request)
+
+                    def close(self):
+                        self._inner.close()
+
+                _transport = _RelayHeaderTransport(_transport)
             return _httpx.Client(
-                transport=_httpx.HTTPTransport(socket_options=_sock_opts),
+                transport=_transport,
                 proxy=_proxy,
             )
         except Exception:
