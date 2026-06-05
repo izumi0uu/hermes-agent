@@ -37,31 +37,22 @@ import copy
 import hashlib
 import json
 import logging
-logger = logging.getLogger(__name__)
 import os
 import re
 import sys
 import tempfile
-import time
 import threading
+import time
 import uuid
-from typing import List, Dict, Any, Optional
-# NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
-# SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
-# that imports the SDK on first call/isinstance check. This preserves:
-#   (a) the single in-module `OpenAI(**client_kwargs)` call site at
-#       _create_openai_client, and
-#   (b) `patch("run_agent.OpenAI", ...)` test patterns used by ~28 test files.
-#
-# NOTE: `fire` is ONLY used in the `__main__` block below (for running
-# run_agent.py directly as a CLI) — it is NOT needed for library usage.
-# It is imported there, not here, so that importing run_agent from a
-# daemon thread (e.g. curator's forked review agent) never fails with
-# ModuleNotFoundError on broken/partial installs where `fire` isn't present.
 from datetime import datetime
 from pathlib import Path
-
 from hermes_constants import get_hermes_home
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+logger = logging.getLogger(__name__)
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
@@ -2967,31 +2958,8 @@ class AIAgent:
             # Explicitly read proxy settings while still honoring NO_PROXY for
             # loopback / local endpoints such as a locally hosted sub2api.
             _proxy = _get_proxy_for_base_url(base_url)
-            _transport = _httpx.HTTPTransport(socket_options=_sock_opts)
-            if (
-                base_url_host_matches(str(base_url or ""), "tcdmx.com")
-                or base_url_host_matches(str(base_url or ""), "api.clawto.link")
-            ):
-                class _RelayHeaderTransport(_httpx.BaseTransport):
-                    def __init__(self, inner):
-                        self._inner = inner
-
-                    def handle_request(self, request):
-                        # Some OpenAI-compatible relays reject the OpenAI
-                        # Python SDK's X-Stainless telemetry headers.
-                        for name in list(request.headers.keys()):
-                            lname = name.lower()
-                            if lname.startswith("x-stainless-") or lname == "user-agent":
-                                request.headers.pop(name, None)
-                        request.headers["User-Agent"] = "curl/8.7.1"
-                        return self._inner.handle_request(request)
-
-                    def close(self):
-                        self._inner.close()
-
-                _transport = _RelayHeaderTransport(_transport)
             return _httpx.Client(
-                transport=_transport,
+                transport=_httpx.HTTPTransport(socket_options=_sock_opts),
                 proxy=_proxy,
             )
         except Exception:
