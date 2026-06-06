@@ -603,6 +603,7 @@ export const en: Translations = {
     row: {
       pin: 'Pin',
       unpin: 'Unpin',
+      openInNewWindow: 'Open in New Window',
       copyId: 'Copy ID',
       export: 'Export',
       rename: 'Rename',

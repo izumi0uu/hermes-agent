@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/dialog'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
+import { sessionRoute } from '@/app/routes'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
@@ -56,6 +57,15 @@ function useSessionActions({ sessionId, title, pinned = false, profile, onPin, o
       onSelect: () => {
         triggerHaptic('selection')
         onPin?.()
+      }
+    },
+    {
+      disabled: !sessionId || !window.hermesDesktop?.openWindow,
+      icon: 'go-to-file',
+      label: r.openInNewWindow,
+      onSelect: () => {
+        triggerHaptic('selection')
+        void window.hermesDesktop?.openWindow?.({ route: sessionRoute(sessionId) })
       }
     },
     {

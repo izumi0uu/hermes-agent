@@ -44,6 +44,7 @@ declare global {
       setPreviewShortcutActive?: (active: boolean) => void
       openExternal: (url: string) => Promise<void>
       fetchLinkTitle: (url: string) => Promise<string>
+      openWindow?: (options?: { route?: string }) => Promise<{ ok: boolean }>
       settings: {
         getDefaultProjectDir: () => Promise<{ defaultLabel: string; dir: null | string }>
         pickDefaultProjectDir: () => Promise<{ canceled: boolean; dir: null | string }>

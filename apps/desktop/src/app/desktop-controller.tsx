@@ -412,6 +412,27 @@ export function DesktopController() {
     [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
   )
 
+  useEffect(() => {
+    const onFocus = () => {
+      if (currentView !== 'chat' || gatewayState !== 'open' || busyRef.current) {
+        return
+      }
+
+      const storedSessionId = selectedStoredSessionIdRef.current
+      const runtimeSessionId = activeSessionIdRef.current
+
+      if (!storedSessionId || !runtimeSessionId) {
+        return
+      }
+
+      void hydrateFromStoredSession(1, storedSessionId, runtimeSessionId)
+    }
+
+    window.addEventListener('focus', onFocus)
+
+    return () => window.removeEventListener('focus', onFocus)
+  }, [currentView, gatewayState, hydrateFromStoredSession, selectedStoredSessionIdRef, activeSessionIdRef])
+
   const { handleGatewayEvent } = useMessageStream({
     activeSessionIdRef,
     hydrateFromStoredSession,

@@ -274,18 +274,19 @@ const APP_ICON_PATHS = [
   path.join(unpackedPathFor(APP_ROOT), 'dist', 'apple-touch-icon.png')
 ]
 
-let rendererTitleBarTheme = null
+const rendererTitleBarThemeByWindow = new WeakMap()
 const terminalSessions = new Map()
 
 function isHexColor(value) {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
 }
 
-function getTitleBarOverlayOptions() {
+function getTitleBarOverlayOptions(window) {
   if (IS_MAC) {
     return { height: TITLEBAR_HEIGHT }
   }
 
+  const rendererTitleBarTheme = window ? rendererTitleBarThemeByWindow.get(window) || null : null
   if (rendererTitleBarTheme) {
     return {
       color: rendererTitleBarTheme.background,
@@ -519,7 +520,8 @@ let connectionConfigCache = null
 let connectionConfigCacheMtime = null
 const hermesLog = []
 const previewWatchers = new Map()
-let previewShortcutActive = false
+const desktopWindows = new Set()
+const previewShortcutActiveByWindow = new WeakMap()
 let desktopLogBuffer = ''
 let desktopLogFlushTimer = null
 let desktopLogFlushPromise = Promise.resolve()
@@ -715,11 +717,65 @@ function clampBootProgress(value) {
   return Math.max(0, Math.min(100, Math.round(numeric)))
 }
 
+function listDesktopWindows() {
+  return [...desktopWindows].filter(window => window && !window.isDestroyed())
+}
+
+function getLastActiveWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return mainWindow
+  }
+
+  const [firstWindow] = listDesktopWindows()
+  mainWindow = firstWindow || null
+  return mainWindow
+}
+
+function getFocusedDesktopWindow() {
+  const focused = BrowserWindow.getFocusedWindow()
+  if (focused && !focused.isDestroyed()) {
+    return focused
+  }
+  return getLastActiveWindow()
+}
+
+function resolveTargetWindow(eventOrWindow) {
+  if (eventOrWindow?.sender) {
+    return BrowserWindow.fromWebContents(eventOrWindow.sender) || getFocusedDesktopWindow()
+  }
+  if (eventOrWindow && typeof eventOrWindow.isDestroyed === 'function') {
+    return eventOrWindow.isDestroyed() ? getFocusedDesktopWindow() : eventOrWindow
+  }
+  return getFocusedDesktopWindow()
+}
+
+function withWindowWebContents(window, callback) {
+  if (!window || window.isDestroyed()) return false
+  const { webContents } = window
+  if (!webContents || webContents.isDestroyed()) return false
+  callback(webContents)
+  return true
+}
+
+function sendToWindow(window, channel, payload) {
+  return withWindowWebContents(window, webContents => {
+    webContents.send(channel, payload)
+  })
+}
+
+function broadcastToWindows(channel, payload) {
+  for (const window of listDesktopWindows()) {
+    sendToWindow(window, channel, payload)
+  }
+}
+
+function rememberActiveWindow(window) {
+  if (!window || window.isDestroyed()) return
+  mainWindow = window
+}
+
 function broadcastBootProgress() {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:boot-progress', bootProgressState)
+  broadcastToWindows('hermes:boot-progress', bootProgressState)
 }
 
 // Bootstrap-event broadcast channel + state. The bootstrap runner emits a
@@ -792,10 +848,7 @@ function broadcastBootstrapEvent(ev) {
     }
   }
 
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:bootstrap:event', ev)
+  broadcastToWindows('hermes:bootstrap:event', ev)
 }
 
 function getBootstrapState() {
@@ -1815,6 +1868,27 @@ function resolveRendererIndex() {
   return candidates.find(fileExists) || candidates[0]
 }
 
+function normalizeWindowRoute(route) {
+  if (typeof route !== 'string') return ''
+  const trimmed = route.trim()
+  if (!trimmed || trimmed === '/' || trimmed === '#/' || trimmed === '#') {
+    return ''
+  }
+
+  const withoutHash = trimmed.startsWith('#') ? trimmed.slice(1) : trimmed
+  return withoutHash.startsWith('/') ? withoutHash : `/${withoutHash}`
+}
+
+function rendererUrlForRoute(route) {
+  const normalizedRoute = normalizeWindowRoute(route)
+  if (DEV_SERVER) {
+    return `${DEV_SERVER.replace(/\/$/, '')}/#${normalizedRoute || '/'}`
+  }
+
+  const fileUrl = pathToFileURL(resolveRendererIndex()).toString()
+  return normalizedRoute ? `${fileUrl}#${normalizedRoute}` : fileUrl
+}
+
 function resolveHermesCwd() {
   // In a packaged build, `process.cwd()` resolves to the install root (e.g.
   // `…/win-unpacked` on Windows or `/Applications/Hermes.app/Contents/...`
@@ -2682,10 +2756,10 @@ async function copyImageFromUrl(rawUrl) {
   clipboard.writeImage(image)
 }
 
-async function saveImageFromUrl(rawUrl) {
+async function saveImageFromUrl(rawUrl, window = getFocusedDesktopWindow()) {
   const { buffer, mimeType } = await resourceBufferFromUrl(rawUrl)
   const fallbackName = filenameFromUrl(rawUrl, `image${extensionForMimeType(mimeType) || '.png'}`)
-  const result = await dialog.showSaveDialog(mainWindow, {
+  const result = await dialog.showSaveDialog(window, {
     title: 'Save Image',
     defaultPath: fallbackName
   })
@@ -2816,10 +2890,7 @@ function filePathFromPreviewUrl(rawUrl) {
 }
 
 function sendPreviewFileChanged(payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:preview-file-changed', payload)
+  broadcastToWindows('hermes:preview-file-changed', payload)
 }
 
 function watchPreviewFile(rawUrl) {
@@ -2889,9 +2960,9 @@ async function waitForHermes(baseUrl, token) {
   throw new Error(`Hermes backend did not become ready: ${lastError?.message || 'timeout'}`)
 }
 
-function getWindowButtonPosition() {
+function getWindowButtonPosition(window) {
   if (!IS_MAC) return null
-  return mainWindow?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
+  return window?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
 }
 
 function getNativeOverlayWidth() {
@@ -2902,36 +2973,27 @@ function getNativeOverlayWidth() {
   return IS_MAC ? 0 : NATIVE_OVERLAY_BUTTON_WIDTH
 }
 
-function getWindowState() {
+function getWindowState(window = getFocusedDesktopWindow()) {
   return {
-    isFullscreen: Boolean(mainWindow?.isFullScreen?.()),
+    isFullscreen: Boolean(window?.isFullScreen?.()),
     nativeOverlayWidth: getNativeOverlayWidth(),
-    windowButtonPosition: getWindowButtonPosition()
+    windowButtonPosition: getWindowButtonPosition(window)
   }
 }
 
 function sendBackendExit(payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:backend-exit', payload)
+  broadcastToWindows('hermes:backend-exit', payload)
 }
 
-function sendClosePreviewRequested() {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:close-preview-requested')
+function sendClosePreviewRequested(window = getFocusedDesktopWindow()) {
+  sendToWindow(window, 'hermes:close-preview-requested')
 }
 
 // Tell the renderer the machine just woke. Sleep silently drops the
 // renderer's WebSocket to the local backend; the renderer reconnects on this
 // signal so the chat composer doesn't stay stuck on "Starting Hermes...".
 function sendPowerResume() {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:power-resume')
+  broadcastToWindows('hermes:power-resume')
 }
 
 let powerResumeRegistered = false
@@ -2954,26 +3016,22 @@ function getAppIconPath() {
   return APP_ICON_PATHS.find(fileExists)
 }
 
-function sendOpenUpdatesRequested() {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  webContents.send('hermes:open-updates')
-  if (!mainWindow.isVisible()) mainWindow.show()
-  mainWindow.focus()
+function sendOpenUpdatesRequested(window = getFocusedDesktopWindow()) {
+  if (!sendToWindow(window, 'hermes:open-updates')) {
+    return
+  }
+  if (!window.isVisible()) window.show()
+  window.focus()
 }
 
-function sendWindowStateChanged(nextIsFullscreen) {
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  const { webContents } = mainWindow
-  if (!webContents || webContents.isDestroyed()) return
-  const state = getWindowState()
+function sendWindowStateChanged(window = getFocusedDesktopWindow(), nextIsFullscreen) {
+  const state = getWindowState(window)
 
   if (typeof nextIsFullscreen === 'boolean') {
     state.isFullscreen = nextIsFullscreen
   }
 
-  webContents.send('hermes:window-state-changed', state)
+  sendToWindow(window, 'hermes:window-state-changed', state)
 }
 
 function buildApplicationMenu() {
@@ -2981,6 +3039,11 @@ function buildApplicationMenu() {
   const checkForUpdatesItem = {
     label: 'Check for Updates…',
     click: () => sendOpenUpdatesRequested()
+  }
+  const newWindowMenuItem = {
+    accelerator: 'CommandOrControl+Shift+N',
+    click: () => createWindow(),
+    label: 'New Window'
   }
   if (IS_MAC) {
     template.push({
@@ -3003,14 +3066,18 @@ function buildApplicationMenu() {
   template.push({
     label: 'File',
     submenu: [
+      { ...newWindowMenuItem },
+      { type: 'separator' },
       IS_MAC
         ? {
             accelerator: 'CommandOrControl+W',
             click: () => {
-              if (previewShortcutActive) {
-                sendClosePreviewRequested()
+              const window = getFocusedDesktopWindow()
+              if (!window) return
+              if (previewShortcutActiveByWindow.get(window)) {
+                sendClosePreviewRequested(window)
               } else {
-                mainWindow?.close()
+                window.close()
               }
             },
             label: 'Close'
@@ -3042,27 +3109,29 @@ function buildApplicationMenu() {
         label: 'Actual Size',
         accelerator: 'CommandOrControl+0',
         click: () => {
-          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.setZoomLevel(0)
+          withWindowWebContents(getFocusedDesktopWindow(), webContents => {
+            webContents.setZoomLevel(0)
+          })
         }
       },
       {
         label: 'Zoom In',
         accelerator: 'CommandOrControl+Plus',
         click: () => {
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            const next = Math.min(mainWindow.webContents.getZoomLevel() + 0.1, 9)
-            mainWindow.webContents.setZoomLevel(next)
-          }
+          withWindowWebContents(getFocusedDesktopWindow(), webContents => {
+            const next = Math.min(webContents.getZoomLevel() + 0.1, 9)
+            webContents.setZoomLevel(next)
+          })
         }
       },
       {
         label: 'Zoom Out',
         accelerator: 'CommandOrControl+-',
         click: () => {
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            const next = Math.max(mainWindow.webContents.getZoomLevel() - 0.1, -9)
-            mainWindow.webContents.setZoomLevel(next)
-          }
+          withWindowWebContents(getFocusedDesktopWindow(), webContents => {
+            const next = Math.max(webContents.getZoomLevel() - 0.1, -9)
+            webContents.setZoomLevel(next)
+          })
         }
       },
       { type: 'separator' },
@@ -3072,7 +3141,7 @@ function buildApplicationMenu() {
   template.push({
     label: 'Window',
     submenu: IS_MAC
-      ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'front' }]
+      ? [{ ...newWindowMenuItem }, { type: 'separator' }, { role: 'minimize' }, { role: 'zoom' }, { type: 'separator' }, { role: 'front' }]
       : [{ role: 'minimize' }, { role: 'close' }]
   })
   template.push({
@@ -3116,10 +3185,10 @@ function installPreviewShortcut(window) {
     const key = String(input.key || '').toLowerCase()
     const isPreviewCloseShortcut = key === 'w' && (IS_MAC ? input.meta : input.control) && !input.alt && !input.shift
 
-    if (!isPreviewCloseShortcut || !previewShortcutActive) return
+    if (!isPreviewCloseShortcut || !previewShortcutActiveByWindow.get(window)) return
 
     event.preventDefault()
-    sendClosePreviewRequested()
+    sendClosePreviewRequested(window)
   })
 }
 
@@ -3598,6 +3667,19 @@ async function freshGatewayWsUrl(profile) {
   }
   // Local/token: the cached wsUrl already carries the (long-lived) token.
   return connection.wsUrl
+}
+
+function attachWindowState(connection, window = getFocusedDesktopWindow()) {
+  return {
+    ...connection,
+    ...getWindowState(window)
+  }
+}
+
+function reloadAllWindows() {
+  for (const window of listDesktopWindows()) {
+    window.reload()
+  }
 }
 
 function encryptDesktopSecret(value) {
@@ -4251,8 +4333,7 @@ async function spawnPoolBackend(profile, entry) {
     return {
       ...remote,
       profile,
-      logs: hermesLog.slice(-80),
-      ...getWindowState()
+      logs: hermesLog.slice(-80)
     }
   }
 
@@ -4316,8 +4397,7 @@ async function spawnPoolBackend(profile, entry) {
     token,
     profile,
     wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(token)}`,
-    logs: hermesLog.slice(-80),
-    ...getWindowState()
+    logs: hermesLog.slice(-80)
   }
 }
 
@@ -4374,8 +4454,7 @@ async function startHermes() {
         authMode: remote.authMode || 'token',
         token: remote.token,
         wsUrl: remote.wsUrl,
-        logs: hermesLog.slice(-80),
-        ...getWindowState()
+        logs: hermesLog.slice(-80)
       }
     }
 
@@ -4487,8 +4566,7 @@ async function startHermes() {
       authMode: 'token',
       token,
       wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(token)}`,
-      logs: hermesLog.slice(-80),
-      ...getWindowState()
+      logs: hermesLog.slice(-80)
     }
   })().catch(error => {
     const message = error instanceof Error ? error.message : String(error)
@@ -4508,9 +4586,10 @@ async function startHermes() {
   return connectionPromise
 }
 
-function createWindow() {
+function createWindow(options = {}) {
+  const initialRoute = normalizeWindowRoute(options.route)
   const icon = getAppIconPath()
-  mainWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width: 1220,
     height: 800,
     minWidth: 900,
@@ -4523,7 +4602,7 @@ function createWindow() {
     // to paint native min/max/close in the top-right of the renderer; on
     // macOS it just reserves a content inset alongside the traffic lights.
     titleBarStyle: 'hidden',
-    titleBarOverlay: getTitleBarOverlayOptions(),
+    titleBarOverlay: getTitleBarOverlayOptions(null),
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     icon,
@@ -4537,9 +4616,12 @@ function createWindow() {
       devTools: true
     }
   })
+  desktopWindows.add(window)
+  rememberActiveWindow(window)
+  previewShortcutActiveByWindow.set(window, false)
 
   if (IS_MAC) {
-    mainWindow.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
+    window.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
     if (icon) {
       app.dock?.setIcon(icon)
     }
@@ -4549,26 +4631,45 @@ function createWindow() {
     if (!nativeThemeListenerInstalled) {
       nativeThemeListenerInstalled = true
       nativeTheme.on('updated', () => {
-        mainWindow?.setTitleBarOverlay?.(getTitleBarOverlayOptions())
+        for (const openWindow of listDesktopWindows()) {
+          openWindow.setTitleBarOverlay?.(getTitleBarOverlayOptions(openWindow))
+        }
       })
     }
   }
 
-  mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
-  mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
-  mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
-  mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
+  window.on('focus', () => rememberActiveWindow(window))
+  window.on('show', () => rememberActiveWindow(window))
+  window.on('closed', () => {
+    desktopWindows.delete(window)
+    if (mainWindow === window) {
+      mainWindow = null
+    }
+  })
+  window.on('will-enter-full-screen', () => sendWindowStateChanged(window, true))
+  window.on('enter-full-screen', () => sendWindowStateChanged(window, true))
+  window.on('will-leave-full-screen', () => sendWindowStateChanged(window, false))
+  window.on('leave-full-screen', () => sendWindowStateChanged(window, false))
 
-  installPreviewShortcut(mainWindow)
-  installDevToolsShortcut(mainWindow)
-  installZoomShortcuts(mainWindow)
-  installContextMenu(mainWindow)
-  mainWindow.webContents.setWindowOpenHandler(details => {
+  installPreviewShortcut(window)
+  installDevToolsShortcut(window)
+  installZoomShortcuts(window)
+  installContextMenu(window)
+  window.webContents.on('before-input-event', (event, input) => {
+    const key = String(input.key || '').toLowerCase()
+    const isNewWindowShortcut =
+      key === 'n' && (IS_MAC ? input.meta : input.control) && input.shift && !input.alt
+
+    if (!isNewWindowShortcut) return
+    event.preventDefault()
+    createWindow()
+  })
+  window.webContents.setWindowOpenHandler(details => {
     openExternalUrl(details.url)
 
     return { action: 'deny' }
   })
-  mainWindow.webContents.on('will-navigate', (event, url) => {
+  window.webContents.on('will-navigate', (event, url) => {
     if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
       return
     }
@@ -4577,7 +4678,7 @@ function createWindow() {
     openExternalUrl(url)
   })
 
-  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+  window.webContents.on('render-process-gone', (_event, details) => {
     rememberLog(`[renderer] render-process-gone reason=${details?.reason} exitCode=${details?.exitCode}`)
 
     if (details?.reason === 'crashed' || details?.reason === 'oom') {
@@ -4594,9 +4695,9 @@ function createWindow() {
 
       rendererReloadTimes.push(now)
       setImmediate(() => {
-        if (!mainWindow || mainWindow.isDestroyed()) return
+        if (!window || window.isDestroyed()) return
         try {
-          mainWindow.webContents.reload()
+          window.webContents.reload()
         } catch (err) {
           rememberLog(`[renderer] reload after crash failed: ${err?.message || err}`)
         }
@@ -4604,13 +4705,13 @@ function createWindow() {
     }
   })
 
-  mainWindow.webContents.on('unresponsive', () => rememberLog('[renderer] webContents became unresponsive'))
+  window.webContents.on('unresponsive', () => rememberLog('[renderer] webContents became unresponsive'))
 
   // Electron always passes the event first. The canonical (Electron 36+) shape
   // is (event, messageDetails); the deprecated positional shape is
   // (event, level, message, line, sourceId). Handle both. `level` is numeric
   // (0..3), where 3 === error.
-  mainWindow.webContents.on('console-message', (_event, detailsOrLevel, message, line, sourceId) => {
+  window.webContents.on('console-message', (_event, detailsOrLevel, message, line, sourceId) => {
     const details = detailsOrLevel && typeof detailsOrLevel === 'object' ? detailsOrLevel : null
     const level = details ? details.level : detailsOrLevel
 
@@ -4622,20 +4723,24 @@ function createWindow() {
     rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
   })
 
-  if (DEV_SERVER) {
-    mainWindow.loadURL(DEV_SERVER)
-  } else {
-    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
-  }
+  window.loadURL(rendererUrlForRoute(initialRoute))
 
-  mainWindow.webContents.once('did-finish-load', () => {
-    broadcastBootProgress()
-    sendWindowStateChanged()
+  window.webContents.once('did-finish-load', () => {
+    sendToWindow(window, 'hermes:boot-progress', bootProgressState)
+    sendWindowStateChanged(window)
     startHermes().catch(error => rememberLog(error.stack || error.message))
   })
+
+  return window
 }
 
-ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
+ipcMain.handle('hermes:connection', async (event, profile) =>
+  attachWindowState(await ensureBackend(profile), resolveTargetWindow(event))
+)
+ipcMain.handle('hermes:window:open', async (_event, options = {}) => {
+  createWindow({ route: options?.route })
+  return { ok: true }
+})
 ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   touchPoolBackend(profile)
   return { ok: true }
@@ -4721,7 +4826,7 @@ ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
-ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
+ipcMain.handle('hermes:connection-config:apply', async (event, payload) => {
   const config = coerceDesktopConnectionConfig(payload)
   writeDesktopConnectionConfig(config)
 
@@ -4736,27 +4841,29 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
     // Global connection, or the primary profile's connection: re-home the
     // window backend by tearing it down and reloading the renderer.
     await teardownPrimaryBackendAndWait()
-    mainWindow?.reload()
+    reloadAllWindows()
   }
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
 ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
-ipcMain.handle('hermes:profile:set', async (_event, name) => {
+ipcMain.handle('hermes:profile:set', async (event, name) => {
   const next = writeActiveDesktopProfile(name)
 
   // Switching profiles is a backend re-home: relaunch the dashboard under the
   // new HERMES_HOME. Pool backends keep their own homes, so only the primary
   // is torn down.
   await teardownPrimaryBackendAndWait()
-  mainWindow?.reload()
+  reloadAllWindows()
 
   return { profile: next }
 })
 
-ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
-  previewShortcutActive = Boolean(active)
+ipcMain.on('hermes:previewShortcutActive', (event, active) => {
+  const window = resolveTargetWindow(event)
+  if (!window) return
+  previewShortcutActiveByWindow.set(window, Boolean(active))
 })
 
 ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
@@ -4973,7 +5080,7 @@ ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
   }
 })
 
-ipcMain.handle('hermes:selectPaths', async (_event, options = {}) => {
+ipcMain.handle('hermes:selectPaths', async (event, options = {}) => {
   const properties = options?.directories ? ['openDirectory'] : ['openFile']
   if (options?.multiple !== false) properties.push('multiSelections')
 
@@ -4986,7 +5093,7 @@ ipcMain.handle('hermes:selectPaths', async (_event, options = {}) => {
     }
   }
 
-  const result = await dialog.showOpenDialog(mainWindow, {
+  const result = await dialog.showOpenDialog(resolveTargetWindow(event), {
     title: options?.title || 'Add context',
     defaultPath: resolvedDefaultPath,
     properties,
@@ -5002,7 +5109,9 @@ ipcMain.handle('hermes:writeClipboard', (_event, text) => {
   return true
 })
 
-ipcMain.handle('hermes:saveImageFromUrl', (_event, url) => saveImageFromUrl(String(url || '')))
+ipcMain.handle('hermes:saveImageFromUrl', (event, url) =>
+  saveImageFromUrl(String(url || ''), resolveTargetWindow(event))
+)
 
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
   const data = payload?.data
@@ -5029,16 +5138,19 @@ ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(Stri
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
-ipcMain.on('hermes:titlebar-theme', (_event, payload) => {
+ipcMain.on('hermes:titlebar-theme', (event, payload) => {
   if (!payload || !isHexColor(payload.background) || !isHexColor(payload.foreground)) {
     return
   }
 
-  rendererTitleBarTheme = {
+  const window = resolveTargetWindow(event)
+  if (!window) return
+
+  rendererTitleBarThemeByWindow.set(window, {
     background: payload.background,
     foreground: payload.foreground
-  }
-  mainWindow?.setTitleBarOverlay?.(getTitleBarOverlayOptions())
+  })
+  window.setTitleBarOverlay?.(getTitleBarOverlayOptions(window))
 })
 
 ipcMain.handle('hermes:openExternal', (_event, url) => {

@@ -732,6 +732,7 @@ export const zh: Translations = {
     row: {
       pin: '置顶',
       unpin: '取消置顶',
+      openInNewWindow: '在新窗口中打开',
       copyId: '复制 ID',
       export: '导出',
       rename: '重命名',

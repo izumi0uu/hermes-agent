@@ -461,6 +461,26 @@ export function useSessionActions({
         clearComposerAttachments()
 
         try {
+          const latest = await getSessionMessages(storedSessionId, sessionProfile)
+
+          if (!isCurrentResume()) {
+            return
+          }
+
+          updateSessionState(
+            cachedRuntimeId,
+            state => ({
+              ...state,
+              messages: preserveLocalAssistantErrors(toChatMessages(latest.messages), state.messages)
+            }),
+            storedSessionId
+          )
+        } catch {
+          // Best-effort rehydrate only. Keep the warm runtime cache when the
+          // stored snapshot is temporarily unavailable.
+        }
+
+        try {
           const usage = await requestGateway<UsageStats>('session.usage', { session_id: cachedRuntimeId })
 
           if (!isCurrentResume()) {
