@@ -1239,6 +1239,11 @@ export const zh: Translations = {
     }
   },
 
+  chat: {
+    forkOriginNotice: '从对话中派生',
+    openSourceConversation: title => (title ? `打开来源对话:${title}` : '打开来源对话')
+  },
+
   composer: {
     message: '消息',
     wakingProfile: profile => `正在唤醒 ${profile}…`,

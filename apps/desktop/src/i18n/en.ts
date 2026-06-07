@@ -1092,6 +1092,11 @@ export const en: Translations = {
     }
   },
 
+  chat: {
+    forkOriginNotice: 'Forked from conversation',
+    openSourceConversation: title => (title ? `Open source conversation: ${title}` : 'Open source conversation')
+  },
+
   composer: {
     message: 'Message',
     wakingProfile: profile => `Waking up ${profile}…`,

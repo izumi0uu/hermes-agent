@@ -849,6 +849,11 @@ export interface Translations {
     }
   }
 
+  chat: {
+    forkOriginNotice: string
+    openSourceConversation: (title: string) => string
+  }
+
   composer: {
     message: string
     wakingProfile: (profile: string) => string

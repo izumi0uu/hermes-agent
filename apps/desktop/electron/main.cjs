@@ -4875,6 +4875,7 @@ ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
 // remote host, so the request must go there (where it serves its own state.db).
 //   GET    /api/profiles/sessions        → splice each remote profile's rows in
 //   GET    /api/sessions/{id}[/messages] → read from remote
+//   POST   /api/sessions/{id}/fork      → fork on remote
 //   DELETE /api/sessions/{id}            → delete on remote
 //   PATCH  /api/sessions/{id}            → rename/archive on remote
 async function interceptSessionRequestForRemote(request) {
@@ -4909,7 +4910,7 @@ async function interceptSessionRequestForRemote(request) {
   //    param (it serves its own state.db natively).
   //  - global remote mode: ONE backend serves every profile via ?profile=, so
   //    route there and KEEP the profile param so it opens the right state.db.
-  if (/^\/api\/sessions\/[^/]+(\/messages)?$/.test(pathname)) {
+  if (/^\/api\/sessions\/[^/]+(?:\/messages|\/fork)?$/.test(pathname)) {
     const profile = (searchParams.get('profile') || request.profile || '').trim()
     if (!profile) {
       return undefined
