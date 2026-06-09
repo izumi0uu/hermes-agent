@@ -726,6 +726,30 @@ describe('assistant-ui streaming renderer', () => {
     expect(archivedUi.getAllByText('Serve latte').length).toBeGreaterThan(0)
   })
 
+  it('renders archived unfinished todos without a running spinner after turn completion', () => {
+    const todos = [
+      { content: 'Scan large cache and log dirs', id: 'scan-caches', status: 'completed' as const },
+      { content: 'Check trash and downloads leftovers', id: 'scan-trash-downloads', status: 'completed' as const },
+      { content: 'Summarize reclaim candidates safely', id: 'summarize', status: 'completed' as const },
+      { content: 'Inventory deletable downloads archives', id: 'inventory-downloads', status: 'completed' as const },
+      { content: 'Delete archive files and caches', id: 'delete-targets', status: 'completed' as const },
+      { content: 'Verify freed space', id: 'verify-space', status: 'pending' as const },
+      { content: 'Move archives and caches to Trash', id: 'trash-targets', status: 'in_progress' as const }
+    ]
+
+    const { container } = render(<TodoHarness message={assistantTodoMessage(todos, false)} />)
+    const ui = within(container)
+    const panel = container.querySelector('[data-slot="aui_todo-hoisted"]')
+
+    expect(panel).toBeTruthy()
+    expect(ui.getAllByText('Move archives and caches to Trash').length).toBeGreaterThan(0)
+    expect(ui.getAllByText('Verify freed space').length).toBeGreaterThan(0)
+    expect(ui.queryByLabelText('In progress: Move archives and caches to Trash')).toBeNull()
+    expect(ui.getByLabelText('Incomplete: Move archives and caches to Trash')).toBeTruthy()
+    expect(container.querySelectorAll('[data-slot="checkbox"][data-state="checked"]').length).toBe(5)
+    expect(container.querySelectorAll('[data-slot="checkbox"][data-state="unchecked"]').length).toBe(2)
+  })
+
   it('hoists todo outside the thinking disclosure when reasoning is present', () => {
     const { container } = render(
       <TodoHarness
