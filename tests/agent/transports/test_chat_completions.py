@@ -118,6 +118,29 @@ class TestChatCompletionsBuildKwargs:
         kw = transport.build_kwargs(model="claude-sonnet-4", messages=msgs, model_lower="claude-sonnet-4")
         assert kw["messages"][0]["role"] == "system"
 
+    def test_named_custom_gpt_route_uses_top_level_reasoning_effort(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=msgs,
+            base_url="https://ai.input.im/v1",
+            is_custom_provider=True,
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+        )
+        assert kw["reasoning_effort"] == "xhigh"
+        assert "reasoning" not in (kw.get("extra_body") or {})
+
+    def test_named_custom_openrouter_route_skips_top_level_reasoning_effort(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=msgs,
+            base_url="https://openrouter.ai/api/v1",
+            is_custom_provider=True,
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+        )
+        assert "reasoning_effort" not in kw
+
     def test_tools_included(self, transport):
         msgs = [{"role": "user", "content": "Hi"}]
         tools = [{"type": "function", "function": {"name": "test", "parameters": {}}}]

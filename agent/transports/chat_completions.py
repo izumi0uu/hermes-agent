@@ -17,6 +17,7 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+from utils import base_url_hostname
 
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
@@ -97,6 +98,92 @@ def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
     if "generativelanguage.googleapis.com" not in normalized:
         return False
     return normalized.endswith("/openai")
+
+_OPENAI_CHAT_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+_OPENAI_CHAT_REASONING_EXCLUDED_HOSTS = {
+    "openrouter.ai",
+    "api.githubcopilot.com",
+    "models.github.ai",
+    "api.kimi.com",
+    "api.moonshot.ai",
+    "api.moonshot.cn",
+    "api.deepseek.com",
+    "portal.qwen.ai",
+    "api.z.ai",
+    "generativelanguage.googleapis.com",
+}
+
+
+def _normalize_openai_reasoning_model(model: str) -> str:
+    normalized = str(model or "").strip().lower()
+    if normalized.startswith("openai/"):
+        normalized = normalized.split("/", 1)[1]
+    return normalized
+
+
+def _supports_openai_chat_reasoning_effort(model: str, base_url: Any) -> bool:
+    normalized_model = _normalize_openai_reasoning_model(model)
+    if not normalized_model.startswith(_OPENAI_CHAT_REASONING_PREFIXES):
+        return False
+    hostname = base_url_hostname(str(base_url or "")) or ""
+    return hostname not in _OPENAI_CHAT_REASONING_EXCLUDED_HOSTS
+
+
+def _resolve_openai_chat_reasoning_effort(
+    model: str,
+    base_url: Any,
+    reasoning_config: dict | None,
+) -> str | None:
+    """Translate Hermes reasoning config to OpenAI chat ``reasoning_effort``.
+
+    This is for custom OpenAI-compatible chat-completions endpoints serving
+    OpenAI reasoning families (GPT-5 / O-series) without going through the
+    Responses API. Known non-OpenAI wire formats (OpenRouter, Copilot, Kimi,
+    DeepSeek, etc.) are excluded by hostname.
+    """
+    if not isinstance(reasoning_config, dict):
+        return None
+    if reasoning_config.get("enabled") is False:
+        return None
+    if not _supports_openai_chat_reasoning_effort(model, base_url):
+        return None
+
+    normalized_model = _normalize_openai_reasoning_model(model)
+    effort = str(reasoning_config.get("effort") or "medium").strip().lower() or "medium"
+    if effort == "none":
+        return None
+
+    if normalized_model == "gpt-5-pro":
+        return "high"
+
+    if normalized_model.startswith(("o1", "o3", "o4")):
+        if effort in {"minimal", "low"}:
+            return "low"
+        if effort in {"medium", "high"}:
+            return effort
+        if effort == "xhigh":
+            return "high"
+        return "medium"
+
+    if effort in {"minimal", "low", "medium", "high", "xhigh"}:
+        return effort
+    return "medium"
+
+
+def _model_consumes_thought_signature(model: Any) -> bool:
+    """True when the outgoing model is a Gemini family model that requires
+    ``extra_content`` (thought_signature) to be replayed on tool calls.
+
+    Gemini 3 thinking models attach ``extra_content`` to each tool call and
+    reject subsequent requests with HTTP 400 if it is missing. Every other
+    strict OpenAI-compatible provider (Fireworks, Mistral, ...) rejects the
+    request with 400 if ``extra_content`` *is* present. So the field must be
+    kept only when the target model is itself Gemini-family, and stripped
+    otherwise — including when a non-Gemini model inherits stale Gemini
+    ``extra_content`` from earlier in a mixed-provider session.
+    """
+    m = str(model or "").lower()
+    return "gemini" in m or "gemma" in m
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -292,6 +379,7 @@ class ChatCompletionsTransport(ProviderTransport):
         is_kimi = params.get("is_kimi", False)
         is_tokenhub = params.get("is_tokenhub", False)
         reasoning_config = params.get("reasoning_config")
+        is_custom_provider = params.get("is_custom_provider", False)
 
         if ephemeral is not None and max_tokens_fn:
             api_kwargs.update(max_tokens_fn(ephemeral))
@@ -342,6 +430,21 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        base_url = params.get("base_url")
+
+        # Named custom providers can front OpenAI-compatible GPT reasoning
+        # models (for example ai.input.im -> gpt-5.4) while still using the
+        # chat-completions API. Those routes expect top-level
+        # ``reasoning_effort``, not OpenRouter's ``extra_body.reasoning``.
+        if is_custom_provider:
+            _custom_effort = _resolve_openai_chat_reasoning_effort(
+                model,
+                base_url,
+                reasoning_config,
+            )
+            if _custom_effort is not None:
+                api_kwargs["reasoning_effort"] = _custom_effort
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 
@@ -349,7 +452,6 @@ class ChatCompletionsTransport(ProviderTransport):
         is_nous = params.get("is_nous", False)
         is_github_models = params.get("is_github_models", False)
         provider_name = str(params.get("provider_name") or "").strip().lower()
-        base_url = params.get("base_url")
 
         provider_prefs = params.get("provider_preferences")
         if provider_prefs and is_openrouter:

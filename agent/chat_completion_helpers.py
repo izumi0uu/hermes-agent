@@ -766,7 +766,10 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         is_kimi=_is_kimi,
         is_tokenhub=_is_tokenhub,
         is_lmstudio=_is_lmstudio,
-        is_custom_provider=agent.provider == "custom",
+        is_custom_provider=(
+            str(agent.provider or "").strip().lower() == "custom"
+            or str(agent.provider or "").strip().lower().startswith("custom:")
+        ),
         ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None,
         openrouter_min_coding_score=agent.openrouter_min_coding_score,
@@ -1346,6 +1349,18 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             agent._resolve_lmstudio_summary_reasoning_effort()
             if _is_lmstudio_summary else None
         )
+        _custom_reasoning_effort: str | None = None
+        _custom_provider = str(agent.provider or "").strip().lower()
+        if _custom_provider == "custom" or _custom_provider.startswith("custom:"):
+            from agent.transports.chat_completions import (
+                _resolve_openai_chat_reasoning_effort,
+            )
+
+            _custom_reasoning_effort = _resolve_openai_chat_reasoning_effort(
+                agent.model,
+                agent.base_url,
+                agent.reasoning_config,
+            )
         if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
             if agent.reasoning_config is not None:
                 summary_extra_body["reasoning"] = agent.reasoning_config
@@ -1376,6 +1391,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
             if _lm_reasoning_effort is not None:
                 summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+            elif _custom_reasoning_effort is not None:
+                summary_kwargs["reasoning_effort"] = _custom_reasoning_effort
 
             # Include provider routing preferences
             provider_preferences = {}
@@ -1467,6 +1484,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
                 if _lm_reasoning_effort is not None:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+                elif _custom_reasoning_effort is not None:
+                    summary_kwargs["reasoning_effort"] = _custom_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 

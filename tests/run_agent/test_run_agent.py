@@ -5969,6 +5969,20 @@ class TestSupportsReasoningExtraBody:
             assert agent._supports_reasoning_extra_body() is True, model
 
 
+class TestNamedCustomProviderReasoning:
+    def test_build_api_kwargs_sends_reasoning_effort_for_named_custom_gpt(self, agent):
+        agent.provider = "custom:input-im"
+        agent.base_url = "https://ai.input.im/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "gpt-5.4"
+        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert kwargs["reasoning_effort"] == "xhigh"
+        assert "reasoning" not in (kwargs.get("extra_body") or {})
+
+
 class TestMemoryContextSanitization:
     """sanitize_context() helper correctness — used at provider boundaries."""
 
