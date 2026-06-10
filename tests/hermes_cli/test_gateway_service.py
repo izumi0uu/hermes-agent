@@ -451,6 +451,14 @@ class TestGatewayStopCleanup:
 
 
 class TestLaunchdServiceRecovery:
+    @pytest.fixture(autouse=True)
+    def _pin_launchd_domain(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli, "_resolved_launchd_domain", f"user/{os.getuid()}"
+        )
+        yield
+        monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+
     def test_get_restart_drain_timeout_prefers_env_then_config_then_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
         monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
@@ -679,9 +687,21 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
-    def test_launchd_domain_uses_user_domain(self):
-        # The user/<uid> domain (not gui/<uid>) is the one reachable from
-        # non-Aqua/background sessions on macOS 26+ (issue #23387).
+    def test_launchd_domain_uses_user_domain(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd == ["launchctl", "print", f"gui/{os.getuid()}/ai.hermes.gateway"]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    113, cmd, stderr="Could not find service"
+                )
+            if cmd == ["launchctl", "print", f"user/{os.getuid()}/ai.hermes.gateway"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"Unexpected launchctl call: {cmd!r}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
         assert gateway_cli._launchd_domain() == f"user/{os.getuid()}"
 
     def test_launchctl_domain_unsupported_recognizes_macos26_codes(self):
@@ -834,6 +854,83 @@ class TestLaunchdServiceRecovery:
         assert exc.value.code == 1
         out = capsys.readouterr().out
         assert "nohup hermes gateway run" in out
+
+
+class TestLaunchdDomainDetection:
+    @pytest.fixture(autouse=True)
+    def _reset_launchd_domain(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+        yield
+        monkeypatch.setattr(gateway_cli, "_resolved_launchd_domain", None)
+
+    def test_launchd_domain_prefers_gui_when_service_is_loaded(self, monkeypatch):
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd == ["launchctl", "print", "gui/501/ai.hermes.gateway"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"Unexpected launchctl call: {cmd!r}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "gui/501"
+        assert calls == [["launchctl", "print", "gui/501/ai.hermes.gateway"]]
+
+    def test_launchd_domain_uses_managername_for_fresh_aqua_session(self, monkeypatch):
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    113, cmd, stderr="Could not find service"
+                )
+            if cmd == ["launchctl", "managername"]:
+                return SimpleNamespace(returncode=0, stdout="Aqua\n", stderr="")
+            raise AssertionError(f"Unexpected launchctl call: {cmd!r}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "gui/501"
+
+    def test_launchd_domain_defaults_to_user_when_probes_fail(self, monkeypatch):
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+
+        def fake_run(cmd, check=False, **kwargs):
+            if cmd[:2] == ["launchctl", "print"]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    113, cmd, stderr="Could not find service"
+                )
+            if cmd == ["launchctl", "managername"]:
+                raise gateway_cli.subprocess.CalledProcessError(
+                    1, cmd, stderr="manager unavailable"
+                )
+            raise AssertionError(f"Unexpected launchctl call: {cmd!r}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "user/501"
+
+    def test_launchd_domain_caches_probe_result(self, monkeypatch):
+        monkeypatch.setattr(os, "getuid", lambda: 501)
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd == ["launchctl", "print", "gui/501/ai.hermes.gateway"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"Unexpected launchctl call: {cmd!r}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchd_domain() == "gui/501"
+        assert gateway_cli._launchd_domain() == "gui/501"
+        assert calls == [["launchctl", "print", "gui/501/ai.hermes.gateway"]]
 
 
 class TestGatewayServiceDetection:

@@ -3067,12 +3067,66 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
+_resolved_launchd_domain: str | None = None
+
+
 def _launchd_domain() -> str:
-    # The `user/<uid>` domain (vs the older `gui/<uid>`) is reachable from
-    # non-Aqua/background sessions (SSH, headless, login items) and is the only
-    # one that supports service management on macOS 26+. `gui/<uid>` returns
-    # error 125 ("Domain does not support specified action") there. See #23387.
-    return f"user/{os.getuid()}"  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    """Return the launchd domain that actually manages the gateway service.
+
+    Hermes needs to work in both Aqua login sessions and Background/headless
+    sessions. On newer macOS releases neither `gui/<uid>` nor `user/<uid>` is
+    universally correct, so we probe the loaded service first, then fall back
+    to the current launchctl manager as a heuristic.
+    """
+    global _resolved_launchd_domain
+    if _resolved_launchd_domain is not None:
+        return _resolved_launchd_domain
+
+    uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+    label = get_launchd_label()
+    gui_domain = f"gui/{uid}"
+    user_domain = f"user/{uid}"
+
+    for domain in (gui_domain, user_domain):
+        try:
+            subprocess.run(
+                ["launchctl", "print", f"{domain}/{label}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            _resolved_launchd_domain = domain
+            return domain
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+            OSError,
+        ):
+            pass
+
+    try:
+        result = subprocess.run(
+            ["launchctl", "managername"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if (result.stdout or "").strip() == "Aqua":
+            _resolved_launchd_domain = gui_domain
+            return gui_domain
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+        OSError,
+    ):
+        pass
+
+    _resolved_launchd_domain = user_domain
+    return user_domain
 
 
 # On macOS, exit code 125 ("Domain does not support specified action") and
