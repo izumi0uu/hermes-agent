@@ -1,6 +1,6 @@
 import { cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $composerAttachments, type ComposerAttachment } from '@/store/composer'
@@ -9,6 +9,7 @@ import { $rightSidebarTab } from '@/app/right-sidebar/store'
 import { $fileBrowserOpen, setFileBrowserOpen } from '@/store/layout'
 import type { SessionInfo } from '@/types/hermes'
 
+import type { ClientSessionState } from '../../types'
 import { uploadComposerAttachment, usePromptActions } from './use-prompt-actions'
 
 vi.mock('@/hermes', () => ({
@@ -71,6 +72,12 @@ function Harness({
     current: storedSessionId === undefined ? RUNTIME_SESSION_ID : storedSessionId
   }
   const localBusyRef = busyRef ?? { current: false }
+  const sessionStateRef = useRef<ClientSessionState>({
+    messages: [],
+    busy: false,
+    awaitingResponse: false,
+    interrupted: true
+  } as never)
 
   const actions = usePromptActions({
     activeSessionId: RUNTIME_SESSION_ID,
@@ -85,16 +92,13 @@ function Harness({
     startFreshSessionDraft: () => undefined,
     sttEnabled: false,
     updateSessionState: (_sessionId, updater) => {
-      // Seed with interrupted:true so we can prove a fresh submit clears it.
-      const next = updater({
-        messages: [],
-        busy: false,
-        awaitingResponse: false,
-        interrupted: true
-      } as never) as unknown as Record<string, unknown>
-      onSeedState?.(next)
+      // Seed with interrupted:true so we can prove a fresh submit clears it,
+      // and keep later updates chained like the real store does.
+      const next = updater(sessionStateRef.current)
+      sessionStateRef.current = next
+      onSeedState?.(next as unknown as Record<string, unknown>)
 
-      return next as never
+      return next
     }
   })
 
