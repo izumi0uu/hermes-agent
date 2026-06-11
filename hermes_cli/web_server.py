@@ -104,6 +104,15 @@ _log = logging.getLogger(__name__)
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
+def _desktop_cron_should_yield_to_gateway() -> bool:
+    """Return True when the same-profile gateway should own cron execution."""
+    try:
+        return get_running_pid() is not None
+    except Exception as exc:
+        _log.debug("Desktop cron ownership check failed: %s", exc)
+        return False
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -112,9 +121,10 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     a user creates in the app would never fire. We run a minimal ticker here
     (no live adapters; delivery falls back to the per-platform send path).
 
-    Cross-process safe: ``cron.scheduler.tick`` takes the ``cron/.tick.lock``
-    file lock, so this never double-fires alongside a real gateway on the same
-    HERMES_HOME — whichever process grabs the lock first wins the tick.
+    The shared ``cron/.tick.lock`` only guarantees at-most-once execution; it
+    does not guarantee that the correct process ancestry runs the job. When a
+    same-profile gateway is alive, it owns cron execution and the desktop
+    backend must yield.
     """
     from cron.scheduler import tick as cron_tick
 
@@ -122,7 +132,8 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     # Tick once up front (catches jobs due at launch), then on the interval.
     while not stop_event.is_set():
         try:
-            cron_tick(verbose=False, sync=False)
+            if not _desktop_cron_should_yield_to_gateway():
+                cron_tick(verbose=False, sync=False)
         except Exception as e:
             _log.debug("Desktop cron tick error: %s", e)
         stop_event.wait(interval)
@@ -133,9 +144,9 @@ async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
 
-    # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
-    # since the app has no gateway running the scheduler. Server `hermes
-    # dashboard` is unaffected — it relies on its own gateway.
+    # Desktop-spawned backends (HERMES_DESKTOP=1) keep a minimal ticker alive
+    # so jobs still run when no same-profile gateway exists. The ticker yields
+    # ownership to the gateway whenever one is running for this profile.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":
