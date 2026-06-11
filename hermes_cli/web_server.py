@@ -104,15 +104,6 @@ _log = logging.getLogger(__name__)
 # when the same module is used across TestClient instances or uvicorn reloads.
 # ---------------------------------------------------------------------------
 
-def _desktop_cron_should_yield_to_gateway() -> bool:
-    """Return True when the same-profile gateway should own cron execution."""
-    try:
-        return get_running_pid() is not None
-    except Exception as exc:
-        _log.debug("Desktop cron ownership check failed: %s", exc)
-        return False
-
-
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -122,9 +113,9 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     (no live adapters; delivery falls back to the per-platform send path).
 
     The shared ``cron/.tick.lock`` only guarantees at-most-once execution; it
-    does not guarantee that the correct process ancestry runs the job. When a
-    same-profile gateway is alive, it owns cron execution and the desktop
-    backend must yield.
+    does not guarantee that the correct process ancestry runs the job. The
+    desktop ticker therefore opts into scheduler-level gateway-owner deferral
+    so a live same-profile gateway keeps execution ownership.
     """
     from cron.scheduler import tick as cron_tick
 
@@ -132,8 +123,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     # Tick once up front (catches jobs due at launch), then on the interval.
     while not stop_event.is_set():
         try:
-            if not _desktop_cron_should_yield_to_gateway():
-                cron_tick(verbose=False, sync=False)
+            cron_tick(verbose=False, sync=False, defer_to_gateway_owner=True)
         except Exception as e:
             _log.debug("Desktop cron tick error: %s", e)
         stop_event.wait(interval)
@@ -145,8 +135,8 @@ async def _lifespan(app: "FastAPI"):
     app.state.event_lock = asyncio.Lock()
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) keep a minimal ticker alive
-    # so jobs still run when no same-profile gateway exists. The ticker yields
-    # ownership to the gateway whenever one is running for this profile.
+    # so jobs still run when no same-profile gateway exists. The ticker opts
+    # into scheduler-level gateway-owner deferral on each tick.
     cron_stop: "threading.Event | None" = None
     cron_thread: "threading.Thread | None" = None
     if os.getenv("HERMES_DESKTOP") == "1":

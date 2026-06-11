@@ -4910,18 +4910,25 @@ class TestDesktopCronTicker:
         with self._client():
             assert not called.wait(0.5), "ticker must not run outside the desktop app"
 
-    def test_ticker_skipped_when_same_profile_gateway_running(
+    def test_ticker_requests_gateway_owner_deferral(
         self, monkeypatch, _isolate_hermes_home
     ):
         import threading
         import cron.scheduler as sched
 
         called = threading.Event()
-        monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
+        seen = {}
+
+        def _tick(*_a, **kwargs):
+            seen["kwargs"] = kwargs
+            called.set()
+
+        monkeypatch.setattr(sched, "tick", _tick)
         monkeypatch.setenv("HERMES_DESKTOP", "1")
-        monkeypatch.setattr("hermes_cli.web_server.get_running_pid", lambda: 4242)
 
         with self._client():
-            assert not called.wait(0.5), (
-                "desktop ticker must yield when the same profile gateway is running"
-            )
+            assert called.wait(3.0), "expected cron tick under HERMES_DESKTOP=1"
+
+        assert seen["kwargs"].get("defer_to_gateway_owner") is True
+        assert seen["kwargs"].get("verbose") is False
+        assert seen["kwargs"].get("sync") is False
