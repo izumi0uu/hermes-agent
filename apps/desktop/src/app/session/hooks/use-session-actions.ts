@@ -77,6 +77,8 @@ interface SessionActionsOptions {
   ) => ClientSessionState
 }
 
+type DesktopCloseReason = 'desktop_archive' | 'desktop_delete' | 'desktop_new_chat'
+
 function withAppendedText(message: ChatMessage, suffix: string): ChatMessage {
   let appended = false
 
@@ -392,6 +394,27 @@ export function useSessionActions({
   const copy = t.desktop
   const resumeRequestRef = useRef(0)
 
+  const closeRuntimeIfIdle = useCallback(
+    async (runtimeSessionId: null | string, reason: DesktopCloseReason) => {
+      if (!runtimeSessionId) {
+        return false
+      }
+
+      const runtimeState = sessionStateByRuntimeIdRef.current.get(runtimeSessionId)
+      const isRunning = runtimeState?.busy ?? busyRef.current
+
+      if (isRunning) {
+        return false
+      }
+
+      await requestGateway('session.close', { session_id: runtimeSessionId, reason }).catch(() => undefined)
+      clearQueuedPrompts(runtimeSessionId)
+
+      return true
+    },
+    [busyRef, requestGateway, sessionStateByRuntimeIdRef]
+  )
+
   const startFreshSessionDraft = useCallback(
     (replaceRoute = false) => {
       busyRef.current = false
@@ -427,6 +450,16 @@ export function useSessionActions({
       setFreshDraftReady(true)
     },
     [activeSessionIdRef, busyRef, navigate, selectedStoredSessionIdRef]
+  )
+
+  const abandonCurrentSessionForNewChat = useCallback(
+    async () => {
+      const currentRuntimeId = activeSessionIdRef.current
+
+      startFreshSessionDraft()
+      await closeRuntimeIfIdle(currentRuntimeId, 'desktop_new_chat')
+    },
+    [activeSessionIdRef, closeRuntimeIfIdle, startFreshSessionDraft]
   )
 
   const createBackendSessionForSend = useCallback(
@@ -535,7 +568,7 @@ export function useSessionActions({
   const selectSidebarItem = useCallback(
     (item: SidebarNavItem) => {
       if (item.action === 'new-session') {
-        startFreshSessionDraft()
+        void abandonCurrentSessionForNewChat()
 
         return
       }
@@ -544,7 +577,7 @@ export function useSessionActions({
         navigate(item.route)
       }
     },
-    [navigate, startFreshSessionDraft]
+    [abandonCurrentSessionForNewChat, navigate]
   )
 
   const openSettings = useCallback(() => {
@@ -970,6 +1003,20 @@ export function useSessionActions({
       // live tip after compression. Drop both so the pin can't linger.
       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
 
+      if (closingRuntimeId) {
+        const closed = await closeRuntimeIfIdle(closingRuntimeId, 'desktop_delete')
+
+        if (!closed) {
+          notify({
+            kind: 'warning',
+            title: copy.sessionBusy,
+            message: copy.deleteStopCurrent
+          })
+
+          return
+        }
+      }
+
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
       // doesn't keep claiming the removed row is still on the server.
@@ -983,16 +1030,8 @@ export function useSessionActions({
       }
 
       try {
-        if (closingRuntimeId) {
-          await requestGateway('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
-        }
-
         await deleteSession(storedSessionId, removed?.profile)
         clearQueuedPrompts(storedSessionId)
-
-        if (closingRuntimeId) {
-          clearQueuedPrompts(closingRuntimeId)
-        }
       } catch (err) {
         if (removed) {
           setSessions(prev => [removed, ...prev])
@@ -1031,6 +1070,7 @@ export function useSessionActions({
     [
       activeSessionId,
       activeSessionIdRef,
+      closeRuntimeIfIdle,
       copy,
       navigate,
       requestGateway,
@@ -1046,10 +1086,25 @@ export function useSessionActions({
 
       const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
       const wasSelected = selectedStoredSessionId === storedSessionId
+      const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
+
+      if (closingRuntimeId) {
+        const closed = await closeRuntimeIfIdle(closingRuntimeId, 'desktop_archive')
+
+        if (!closed) {
+          notify({
+            kind: 'warning',
+            title: copy.sessionBusy,
+            message: copy.archiveStopCurrent
+          })
+
+          return
+        }
+      }
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
@@ -1082,10 +1137,11 @@ export function useSessionActions({
         notifyError(err, copy.archiveFailed)
       }
     },
-    [copy, selectedStoredSessionId, startFreshSessionDraft]
+    [activeSessionId, closeRuntimeIfIdle, copy, selectedStoredSessionId, startFreshSessionDraft]
   )
 
   return {
+    abandonCurrentSessionForNewChat,
     archiveSession,
     branchCurrentSession,
     closeSettings,

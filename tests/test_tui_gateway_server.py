@@ -7649,6 +7649,40 @@ def test_session_close_rpc_delegates_to_close_session_by_id(monkeypatch):
     assert seen == [("s9", "tui_close")]
 
 
+def test_session_close_rpc_normalizes_desktop_reason(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        server, "_close_session_by_id",
+        lambda sid, *, end_reason: bool(seen.append((sid, end_reason))) or True,
+    )
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.close",
+            "params": {"session_id": "s9", "reason": "new"},
+        }
+    )
+    assert resp["result"] == {"closed": True}
+    assert seen == [("s9", "desktop_new_chat")]
+
+
+def test_session_close_rpc_falls_back_for_unknown_reason(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        server, "_close_session_by_id",
+        lambda sid, *, end_reason: bool(seen.append((sid, end_reason))) or True,
+    )
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.close",
+            "params": {"session_id": "s9", "reason": "totally-unknown"},
+        }
+    )
+    assert resp["result"] == {"closed": True}
+    assert seen == [("s9", "tui_close")]
+
+
 def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
     seen = []
     monkeypatch.setattr(

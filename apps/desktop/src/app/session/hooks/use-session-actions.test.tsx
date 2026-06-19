@@ -3,10 +3,12 @@ import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { getSessionMessages } from '@/hermes'
+import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
-import { $currentCwd, $messages, $resumeFailedSessionId, setMessages, setResumeFailedSessionId } from '@/store/session'
+import { $currentCwd, $messages, $resumeFailedSessionId, $sessions, setMessages, setResumeFailedSessionId, setSessions } from '@/store/session'
+import type { SessionInfo } from '@/types/hermes'
 
+import type { SidebarNavItem } from '../../types'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
@@ -21,6 +23,27 @@ vi.mock('@/hermes', async importOriginal => ({
 }))
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
+const STORED_SESSION_ID = 'stored-001'
+
+function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
+  return {
+    ended_at: null,
+    id: STORED_SESSION_ID,
+    input_tokens: 0,
+    is_active: true,
+    last_active: 0,
+    message_count: 1,
+    model: null,
+    output_tokens: 0,
+    preview: 'hello',
+    profile: undefined,
+    source: 'tui',
+    started_at: 0,
+    title: 'Session',
+    tool_call_count: 0,
+    ...overrides
+  }
+}
 
 function Harness({
   onReady,
@@ -84,6 +107,7 @@ describe('createBackendSessionForSend profile routing', () => {
     cleanup()
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
+    setSessions([])
     vi.restoreAllMocks()
   })
 
@@ -116,6 +140,210 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ profile: 'default' })
+  })
+})
+
+interface SessionActionsHandle {
+  archiveSession: (storedSessionId: string) => Promise<void>
+  removeSession: (storedSessionId: string) => Promise<void>
+  selectSidebarItem: (item: SidebarNavItem) => void
+}
+
+function ActionsHarness({
+  activeSessionId = RUNTIME_SESSION_ID,
+  busy = false,
+  onReady,
+  requestGateway,
+  selectedStoredSessionId = STORED_SESSION_ID
+}: {
+  activeSessionId?: null | string
+  busy?: boolean
+  onReady: (handle: SessionActionsHandle) => void
+  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  selectedStoredSessionId?: null | string
+}) {
+  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+  const stateByRuntime = new Map<string, ClientSessionState>()
+
+  if (activeSessionId) {
+    stateByRuntime.set(activeSessionId, {
+      awaitingResponse: busy,
+      branch: '',
+      busy,
+      cwd: '',
+      fast: false,
+      messages: [],
+      model: '',
+      needsInput: false,
+      pendingBranchGroup: null,
+      personality: '',
+      provider: '',
+      reasoningEffort: '',
+      sawAssistantPayload: false,
+      serviceTier: '',
+      storedSessionId: selectedStoredSessionId,
+      streamId: null,
+      turnStartedAt: null,
+      interrupted: false,
+      yolo: false
+    })
+  }
+
+  const actions = useSessionActions({
+    activeSessionId,
+    activeSessionIdRef: ref<string | null>(activeSessionId),
+    busyRef: ref(busy),
+    creatingSessionRef: ref(false),
+    ensureSessionState: () => ({}) as ClientSessionState,
+    getRouteToken: () => 'token',
+    navigate: vi.fn() as never,
+    requestGateway,
+    runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef: ref<string | null>(selectedStoredSessionId),
+    sessionStateByRuntimeIdRef: ref(stateByRuntime),
+    syncSessionStateToView: vi.fn(),
+    updateSessionState: (_sessionId, updater) => updater(stateByRuntime.get(activeSessionId ?? '') ?? ({} as ClientSessionState))
+  })
+
+  useEffect(() => {
+    onReady({
+      archiveSession: actions.archiveSession,
+      removeSession: actions.removeSession,
+      selectSidebarItem: actions.selectSidebarItem
+    })
+  }, [actions.archiveSession, actions.removeSession, actions.selectSidebarItem, onReady])
+
+  return null
+}
+
+describe('session boundary runtime closing', () => {
+  afterEach(() => {
+    cleanup()
+    setSessions([])
+    setMessages([])
+    vi.restoreAllMocks()
+  })
+
+  it('closes the idle runtime when the sidebar starts a new chat', async () => {
+    setSessions([storedSession()])
+
+    const requestGateway = vi.fn(async () => ({} as never))
+    let handle: SessionActionsHandle | null = null
+
+    render(
+      <ActionsHarness
+        onReady={value => {
+          handle = value
+        }}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await waitFor(() => expect(handle).not.toBeNull())
+    handle!.selectSidebarItem({ action: 'new-session', icon: (() => null) as never, id: 'new-session', label: 'New' })
+
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('session.close', {
+        reason: 'desktop_new_chat',
+        session_id: RUNTIME_SESSION_ID
+      })
+    )
+  })
+
+  it('does not close a running runtime when starting a new chat', async () => {
+    setSessions([storedSession()])
+
+    const requestGateway = vi.fn(async () => ({} as never))
+    let handle: SessionActionsHandle | null = null
+
+    render(
+      <ActionsHarness
+        busy
+        onReady={value => {
+          handle = value
+        }}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await waitFor(() => expect(handle).not.toBeNull())
+    handle!.selectSidebarItem({ action: 'new-session', icon: (() => null) as never, id: 'new-session', label: 'New' })
+
+    await waitFor(() => expect($messages.get()).toEqual([]))
+    expect(requestGateway).not.toHaveBeenCalledWith('session.close', expect.anything())
+  })
+
+  it('does not archive a running selected session', async () => {
+    setSessions([storedSession()])
+    vi.mocked(setSessionArchived).mockResolvedValue(true as never)
+
+    const requestGateway = vi.fn(async () => ({} as never))
+    let handle: SessionActionsHandle | null = null
+
+    render(<ActionsHarness busy onReady={value => (handle = value)} requestGateway={requestGateway} />)
+
+    await waitFor(() => expect(handle).not.toBeNull())
+    await handle!.archiveSession(STORED_SESSION_ID)
+
+    expect(requestGateway).not.toHaveBeenCalledWith('session.close', expect.anything())
+    expect(setSessionArchived).not.toHaveBeenCalled()
+    expect($sessions.get()).toEqual([storedSession()])
+  })
+
+  it('closes the selected idle runtime before archive', async () => {
+    setSessions([storedSession()])
+    vi.mocked(setSessionArchived).mockResolvedValue(true as never)
+
+    const requestGateway = vi.fn(async () => ({} as never))
+    let handle: SessionActionsHandle | null = null
+
+    render(<ActionsHarness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+
+    await waitFor(() => expect(handle).not.toBeNull())
+    await handle!.archiveSession(STORED_SESSION_ID)
+
+    expect(requestGateway).toHaveBeenCalledWith('session.close', {
+      reason: 'desktop_archive',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(setSessionArchived).toHaveBeenCalledWith(STORED_SESSION_ID, true, undefined)
+  })
+
+  it('does not delete a running selected session', async () => {
+    setSessions([storedSession()])
+    vi.mocked(deleteSession).mockResolvedValue({ deleted: true } as never)
+
+    const requestGateway = vi.fn(async () => ({} as never))
+    let handle: SessionActionsHandle | null = null
+
+    render(<ActionsHarness busy onReady={value => (handle = value)} requestGateway={requestGateway} />)
+
+    await waitFor(() => expect(handle).not.toBeNull())
+    await handle!.removeSession(STORED_SESSION_ID)
+
+    expect(requestGateway).not.toHaveBeenCalledWith('session.close', expect.anything())
+    expect(deleteSession).not.toHaveBeenCalled()
+    expect($sessions.get()).toEqual([storedSession()])
+  })
+
+  it('closes the selected idle runtime before delete', async () => {
+    setSessions([storedSession()])
+    vi.mocked(deleteSession).mockResolvedValue({ deleted: true } as never)
+
+    const requestGateway = vi.fn(async () => ({} as never))
+    let handle: SessionActionsHandle | null = null
+
+    render(<ActionsHarness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+
+    await waitFor(() => expect(handle).not.toBeNull())
+    await handle!.removeSession(STORED_SESSION_ID)
+
+    expect(requestGateway).toHaveBeenCalledWith('session.close', {
+      reason: 'desktop_delete',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(deleteSession).toHaveBeenCalledWith(STORED_SESSION_ID, undefined)
   })
 })
 

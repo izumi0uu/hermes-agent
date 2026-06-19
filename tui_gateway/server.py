@@ -492,6 +492,39 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
     return True
 
 
+_SESSION_CLOSE_REASON_ALIASES = {
+    "archive": "desktop_archive",
+    "delete": "desktop_delete",
+    "new": "desktop_new_chat",
+}
+
+_SESSION_CLOSE_REASON_ALLOWLIST = {
+    "desktop_archive",
+    "desktop_delete",
+    "desktop_explicit_end",
+    "desktop_new_chat",
+    "desktop_window_close",
+    "idle_timeout",
+    "tui_close",
+    "tui_shutdown",
+    "ws_disconnect",
+    "ws_orphan_reap",
+}
+
+
+def _normalize_session_close_reason(raw_reason: object) -> str:
+    """Map RPC-supplied close reasons onto the stable internal vocabulary."""
+    if not isinstance(raw_reason, str):
+        return "tui_close"
+    reason = raw_reason.strip().lower()
+    if not reason:
+        return "tui_close"
+    return _SESSION_CLOSE_REASON_ALIASES.get(
+        reason,
+        reason if reason in _SESSION_CLOSE_REASON_ALLOWLIST else "tui_close",
+    )
+
+
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
     """True if a WS session has no live transport and no in-flight turn.
@@ -5689,13 +5722,14 @@ def _(rid, params: dict) -> dict:
 @method("session.close")
 def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
+    end_reason = _normalize_session_close_reason(params.get("reason"))
     # Serialize against the WS-orphan reaper (which also pops under
     # _session_resume_lock) so a disconnect-reap and an explicit close can't
     # both tear the same session down. _close_session_by_id is the single
     # idempotent teardown path (pop + _teardown_session) and returns False
     # when the session is already gone.
     with _session_resume_lock:
-        return _ok(rid, {"closed": _close_session_by_id(sid, end_reason="tui_close")})
+        return _ok(rid, {"closed": _close_session_by_id(sid, end_reason=end_reason)})
 
 
 @method("session.branch")
