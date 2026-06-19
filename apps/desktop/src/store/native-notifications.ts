@@ -134,6 +134,7 @@ export interface NativeNotificationInput {
   title: string
   body?: string
   sessionId?: null | string
+  focusSessionId?: null | string
   silent?: boolean
   actions?: NativeNotificationAction[]
 }
@@ -156,6 +157,7 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
   void window.hermesDesktop?.notify({
     actions: input.actions,
     body: input.body,
+    focusSessionId: input.focusSessionId ?? undefined,
     kind: input.kind,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,

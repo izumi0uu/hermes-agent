@@ -86,6 +86,17 @@ type SessionRuntimeStatePatch = Partial<
   >
 >
 
+export function focusSessionIdForNotification(
+  runtimeSessionId: null | string | undefined,
+  sessionStateByRuntimeId: ReadonlyMap<string, Pick<ClientSessionState, 'storedSessionId'>>
+): string | undefined {
+  if (!runtimeSessionId) {
+    return undefined
+  }
+
+  return sessionStateByRuntimeId.get(runtimeSessionId)?.storedSessionId ?? undefined
+}
+
 function sessionInfoStatePatch(payload: GatewayEventPayload | undefined): SessionRuntimeStatePatch {
   const patch: SessionRuntimeStatePatch = {}
 
@@ -263,6 +274,23 @@ export function useMessageStream({
   sessionStateByRuntimeIdRef,
   updateSessionState
 }: MessageStreamOptions) {
+  const notifySession = useCallback(
+    (
+      input: Omit<Parameters<typeof dispatchNativeNotification>[0], 'focusSessionId'> & {
+        focusSessionId?: null | string
+      }
+    ) => {
+      dispatchNativeNotification({
+        ...input,
+        focusSessionId:
+          input.focusSessionId ??
+          focusSessionIdForNotification(input.sessionId, sessionStateByRuntimeIdRef.current) ??
+          undefined
+      })
+    },
+    [sessionStateByRuntimeIdRef]
+  )
+
   const sessionInterrupted = useCallback(
     (sessionId: string) => sessionStateByRuntimeIdRef.current.get(sessionId)?.interrupted ?? false,
     [sessionStateByRuntimeIdRef]
@@ -655,14 +683,14 @@ export function useMessageStream({
         void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
       }
 
-      dispatchNativeNotification({
+      notifySession({
         body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
         kind: 'turnDone',
         sessionId,
         title: translateNow('notifications.native.turnDoneTitle')
       })
     },
-    [hydrateFromStoredSession, refreshSessions, updateSessionState]
+    [hydrateFromStoredSession, notifySession, refreshSessions, updateSessionState]
   )
 
   const failAssistantMessage = useCallback(
@@ -972,7 +1000,7 @@ export function useMessageStream({
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
           }
 
-          dispatchNativeNotification({
+          notifySession({
             body: question,
             kind: 'input',
             sessionId,
@@ -1001,7 +1029,7 @@ export function useMessageStream({
           updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
         }
 
-        dispatchNativeNotification({
+        notifySession({
           actions: [
             { id: 'approve', text: translateNow('notifications.native.approveAction') },
             { id: 'reject', text: translateNow('notifications.native.rejectAction') }
@@ -1023,7 +1051,7 @@ export function useMessageStream({
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
           }
 
-          dispatchNativeNotification({
+          notifySession({
             body: translateNow('notifications.native.inputBody'),
             kind: 'input',
             sessionId,
@@ -1050,7 +1078,7 @@ export function useMessageStream({
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
           }
 
-          dispatchNativeNotification({
+          notifySession({
             body: promptText || envVar || translateNow('notifications.native.inputBody'),
             kind: 'input',
             sessionId,
@@ -1120,7 +1148,7 @@ export function useMessageStream({
           compactedTurnRef.current.delete(sessionId)
         }
 
-        dispatchNativeNotification({
+        notifySession({
           body: errorMessage,
           kind: 'turnError',
           sessionId,
@@ -1159,6 +1187,7 @@ export function useMessageStream({
       completeAssistantMessage,
       failAssistantMessage,
       flushQueuedDeltas,
+      notifySession,
       queryClient,
       refreshHermesConfig,
       sessionInterrupted,

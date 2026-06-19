@@ -419,6 +419,7 @@ export interface HermesNotification {
   silent?: boolean
   kind?: string
   sessionId?: string
+  focusSessionId?: string
   actions?: { id: string; text: string }[]
 }
 

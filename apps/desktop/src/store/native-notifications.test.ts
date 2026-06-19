@@ -117,11 +117,23 @@ describe('dispatchNativeNotification preferences', () => {
     expect(notify).toHaveBeenCalledTimes(1)
   })
 
-  it('forwards kind and sessionId to the bridge', () => {
+  it('forwards kind, runtime sessionId, and focusSessionId to the bridge', () => {
     setActiveSessionId('abc')
-    dispatchNativeNotification({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+    dispatchNativeNotification({
+      body: 'hi',
+      focusSessionId: 'stored-abc',
+      kind: 'turnError',
+      sessionId: 'abc',
+      title: 'boom'
+    })
     expect(notify).toHaveBeenCalledWith(
-      expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+      expect.objectContaining({
+        body: 'hi',
+        focusSessionId: 'stored-abc',
+        kind: 'turnError',
+        sessionId: 'abc',
+        title: 'boom'
+      })
     )
   })
 })

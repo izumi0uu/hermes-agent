@@ -5640,8 +5640,14 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   notification.on('click', () => {
     if (!mainWindow || mainWindow.isDestroyed()) return
     focusWindow(mainWindow)
-    if (payload?.sessionId) {
-      mainWindow.webContents.send('hermes:focus-session', payload.sessionId)
+    const focusSessionId =
+      typeof payload?.focusSessionId === 'string' && payload.focusSessionId
+        ? payload.focusSessionId
+        : typeof payload?.sessionId === 'string' && payload.sessionId
+          ? payload.sessionId
+          : ''
+    if (focusSessionId) {
+      mainWindow.webContents.send('hermes:focus-session', focusSessionId)
     }
   })
   notification.on('action', (_actionEvent, index) => {
