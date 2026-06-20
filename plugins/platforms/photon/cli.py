@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import shutil
 import subprocess
@@ -396,7 +397,23 @@ def _install_sidecar() -> int:
         )
     if proc.returncode != 0:
         print("npm install failed", file=sys.stderr)
-    return proc.returncode
+        return proc.returncode
+
+    issues = _sidecar_spectrum_drift_messages()
+    if issues:
+        print("sidecar install verification failed:", file=sys.stderr)
+        for issue in issues:
+            print(f"  - {issue}", file=sys.stderr)
+        print(
+            "Re-run `hermes photon install-sidecar` after removing the drifted "
+            "`node_modules/spectrum-ts`, or restore the committed lockfile.",
+            file=sys.stderr,
+        )
+        return 1
+
+    expected = _sidecar_spectrum_versions().get("expected") or "unknown"
+    print(f"  ✓ sidecar deps verified (spectrum-ts {expected})")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +439,103 @@ def gateway_setup() -> None:
         skip_sidecar_install=False,
     )
     _cmd_setup(args)
+
+
+def _read_json_file(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sidecar_spectrum_versions(sidecar_dir: Path | None = None) -> dict[str, str]:
+    if sidecar_dir is None:
+        sidecar_dir = _SIDECAR_DIR
+    pkg = _read_json_file(sidecar_dir / "package.json")
+    lock = _read_json_file(sidecar_dir / "package-lock.json")
+    installed = _read_json_file(
+        sidecar_dir / "node_modules" / "spectrum-ts" / "package.json"
+    )
+
+    expected = ""
+    deps = pkg.get("dependencies")
+    if isinstance(deps, dict):
+        raw_expected = deps.get("spectrum-ts")
+        if isinstance(raw_expected, str):
+            expected = raw_expected.strip()
+
+    lock_spec = ""
+    lock_version = ""
+    packages = lock.get("packages")
+    if isinstance(packages, dict):
+        root_meta = packages.get("")
+        if isinstance(root_meta, dict):
+            root_deps = root_meta.get("dependencies")
+            if isinstance(root_deps, dict):
+                raw_lock_spec = root_deps.get("spectrum-ts")
+                if isinstance(raw_lock_spec, str):
+                    lock_spec = raw_lock_spec.strip()
+        installed_meta = packages.get("node_modules/spectrum-ts")
+        if isinstance(installed_meta, dict):
+            raw_lock_version = installed_meta.get("version")
+            if isinstance(raw_lock_version, str):
+                lock_version = raw_lock_version.strip()
+
+    if not lock_spec or not lock_version:
+        top_level_deps = lock.get("dependencies")
+        if isinstance(top_level_deps, dict):
+            dep_meta = top_level_deps.get("spectrum-ts")
+            if isinstance(dep_meta, dict):
+                if not lock_spec:
+                    raw_lock_spec = dep_meta.get("version")
+                    if isinstance(raw_lock_spec, str):
+                        lock_spec = raw_lock_spec.strip()
+                if not lock_version:
+                    raw_lock_version = dep_meta.get("version")
+                    if isinstance(raw_lock_version, str):
+                        lock_version = raw_lock_version.strip()
+
+    installed_version = ""
+    raw_installed = installed.get("version")
+    if isinstance(raw_installed, str):
+        installed_version = raw_installed.strip()
+
+    return {
+        "expected": expected,
+        "lock_spec": lock_spec,
+        "lock_version": lock_version,
+        "installed": installed_version,
+    }
+
+
+def _sidecar_spectrum_drift_messages(
+    sidecar_dir: Path | None = None,
+) -> list[str]:
+    if sidecar_dir is None:
+        sidecar_dir = _SIDECAR_DIR
+    versions = _sidecar_spectrum_versions(sidecar_dir)
+    expected = versions["expected"]
+    lock_spec = versions["lock_spec"]
+    lock_version = versions["lock_version"]
+    installed = versions["installed"]
+    issues: list[str] = []
+
+    if not installed:
+        issues.append("node_modules/spectrum-ts is missing after install")
+    if expected and lock_spec and lock_spec != expected:
+        issues.append(
+            f"package-lock pins spectrum-ts as {lock_spec}, but package.json pins {expected}"
+        )
+    if expected and installed and installed != expected:
+        issues.append(
+            f"installed spectrum-ts@{installed}, but package.json pins {expected}"
+        )
+    if lock_version and installed and installed != lock_version:
+        issues.append(
+            f"installed spectrum-ts@{installed}, but package-lock resolves {lock_version}"
+        )
+    return issues
 
 
 # ---------------------------------------------------------------------------

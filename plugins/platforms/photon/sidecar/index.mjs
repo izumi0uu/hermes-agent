@@ -56,6 +56,7 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { once } from "node:events";
 import { patchSpectrumTs } from "./patch-spectrum-mixed-attachments.mjs";
 
@@ -80,6 +81,8 @@ const E164_RE = /^\+\d{6,}$/;
 const MAX_KNOWN_SPACES = 2048;
 const MAX_KNOWN_MESSAGES = 1024;
 const MAX_REACTION_HANDLES = 512;
+const PINNED_SPECTRUM_VERSION = "3.1.0";
+const compatWarnings = new Set();
 
 if (!projectId || !projectSecret || !sharedToken) {
   console.error(
@@ -88,6 +91,29 @@ if (!projectId || !projectSecret || !sharedToken) {
   );
   process.exit(2);
 }
+
+function readInstalledSpectrumVersion() {
+  try {
+    const pkg = JSON.parse(
+      fs.readFileSync(
+        new URL("./node_modules/spectrum-ts/package.json", import.meta.url),
+        "utf8"
+      )
+    );
+    return typeof pkg?.version === "string" ? pkg.version : "";
+  } catch {
+    return "";
+  }
+}
+
+function logCompatWarning(key, message) {
+  if (compatWarnings.has(key)) return;
+  compatWarnings.add(key);
+  console.error(message);
+}
+
+const installedSpectrumVersion = readInstalledSpectrumVersion();
+const installedSpectrumLabel = installedSpectrumVersion || "unknown";
 
 // Lazy-load spectrum-ts so a missing install fails with a clear message
 // instead of a cryptic module-resolution error during import. Apply Hermes'
@@ -134,6 +160,56 @@ try {
       (e && e.stack ? e.stack : String(e))
   );
   process.exit(3);
+}
+
+if (
+  typeof Spectrum !== "function" ||
+  typeof attachment !== "function" ||
+  typeof voice !== "function" ||
+  typeof spectrumText !== "function"
+) {
+  console.error(
+    "photon-sidecar: incompatible spectrum-ts@" +
+      installedSpectrumLabel +
+      " loaded; required builders are missing. " +
+      `Expected pinned spectrum-ts@${PINNED_SPECTRUM_VERSION}. ` +
+      "Run `hermes photon install-sidecar`."
+  );
+  process.exit(3);
+}
+
+if (
+  installedSpectrumVersion &&
+  installedSpectrumVersion !== PINNED_SPECTRUM_VERSION
+) {
+  logCompatWarning(
+    "version-drift",
+    "photon-sidecar: loaded spectrum-ts@" +
+      installedSpectrumVersion +
+      ` but the committed pin is ${PINNED_SPECTRUM_VERSION}. ` +
+      "Compatibility fallbacks are enabled where possible; " +
+      "run `hermes photon install-sidecar`."
+  );
+}
+
+if (typeof spectrumMarkdown !== "function") {
+  logCompatWarning(
+    "missing-markdown-builder",
+    "photon-sidecar: spectrum-ts@" +
+      installedSpectrumLabel +
+      " is missing markdown(); outbound markdown will fall back to text(). " +
+      "Run `hermes photon install-sidecar`."
+  );
+}
+
+if (typeof spectrumTyping !== "function") {
+  logCompatWarning(
+    "missing-typing-builder",
+    "photon-sidecar: spectrum-ts@" +
+      installedSpectrumLabel +
+      " is missing typing(); typing indicators will be skipped. " +
+      "Run `hermes photon install-sidecar`."
+  );
 }
 
 const app = await Spectrum({
@@ -431,6 +507,13 @@ function ok(res, data) {
   res.end(JSON.stringify({ ok: true, ...data }));
 }
 
+function buildOutboundText(text, format) {
+  if (format === "markdown" && typeof spectrumMarkdown === "function") {
+    return spectrumMarkdown(text);
+  }
+  return spectrumText(text);
+}
+
 function handleInbound(req, res) {
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/x-ndjson");
@@ -547,10 +630,10 @@ const server = http.createServer(async (req, res) => {
         return badRequest(res, "format must be text or markdown");
       }
       const space = await resolveSpace(spaceId);
-      // iMessage renders markdown natively; spectrum-ts degrades it to
-      // readable plain text on platforms that don't.
-      const builder =
-        format === "markdown" ? spectrumMarkdown(text) : spectrumText(text);
+      // iMessage renders markdown natively when the SDK exposes markdown();
+      // older/newer SDK lines may not, so we degrade to text() instead of
+      // crashing every outbound send on a drifted install.
+      const builder = buildOutboundText(text, format);
       const result = await space.send(builder);
       return ok(res, { messageId: result?.id || null });
     }
@@ -652,6 +735,9 @@ const server = http.createServer(async (req, res) => {
       if (!spaceId) return badRequest(res, "spaceId is required");
       if (state !== "start" && state !== "stop") {
         return badRequest(res, "state must be start or stop");
+      }
+      if (typeof spectrumTyping !== "function") {
+        return ok(res, { skipped: true });
       }
       const space = await resolveSpace(spaceId);
       await space.send(spectrumTyping(state));
