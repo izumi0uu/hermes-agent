@@ -1651,7 +1651,6 @@ class CLICommandsMixin:
                 print(f"   ⚠ Missing host in browser url: {cdp_url}")
                 print()
                 return
-            _host = parsed_cdp.hostname
             if parsed_cdp.path.startswith("/devtools/browser/"):
                 cdp_url = parsed_cdp.geturl()
             else:
@@ -1662,13 +1661,6 @@ class CLICommandsMixin:
                     fragment="",
                 ).geturl()
 
-            # Clear any existing browser sessions so the next tool call uses the new backend
-            try:
-                from tools.browser_tool import cleanup_all_browsers
-                cleanup_all_browsers()
-            except Exception:
-                pass
-
             print()
 
             # Check if a Chromium-family browser is already serving CDP on the debug port
@@ -1677,30 +1669,17 @@ class CLICommandsMixin:
             if _already_open:
                 print(f"   ✓ Chromium-family browser is already listening on port {_port}")
             elif cdp_url == _DEFAULT_CDP:
-                # Try to auto-launch a Chromium-family browser with remote debugging
-                print("   Chromium-family browser isn't running with remote debugging — attempting to launch...")
-                _launched = self._try_launch_chrome_debug(_port, _plat.system())
-                if _launched:
-                    # Wait for the DevTools discovery endpoint to come up
-                    for _wait in range(10):
-                        if is_browser_debug_ready(cdp_url, timeout=1.0):
-                            _already_open = True
-                            break
-                        time.sleep(0.5)
-                    if _already_open:
-                        print(f"   ✓ Chromium-family browser launched and listening on port {_port}")
-                    else:
-                        print(f"   ⚠ Browser launched but port {_port} isn't responding yet")
-                        print("     Try again in a few seconds — the debug instance may still be starting")
+                print(f"   ⚠ Browser CDP is not reachable at {cdp_url}")
+                sys_name = _plat.system()
+                chrome_cmd = manual_chrome_debug_command(_port, sys_name)
+                if chrome_cmd:
+                    print("   Start a Chromium-family browser with remote debugging, then retry /browser connect:")
+                    print(f"   {chrome_cmd}")
                 else:
-                    print("   ⚠ Could not auto-launch a Chromium-family browser")
-                    sys_name = _plat.system()
-                    chrome_cmd = manual_chrome_debug_command(_port, sys_name)
-                    if chrome_cmd:
-                        print(f"     Launch a Chromium-family browser manually:")
-                        print(f"     {chrome_cmd}")
-                    else:
-                        print("     No supported Chromium-family browser executable found in this environment")
+                    print("   No supported Chromium-family browser executable was found in this environment")
+                    print(
+                        f"   Install one or start a Chromium-family browser with --remote-debugging-port={_port}, then retry /browser connect."
+                    )
             else:
                 print(f"   ⚠ Port {_port} is not reachable at {cdp_url}")
 
@@ -1710,11 +1689,26 @@ class CLICommandsMixin:
                 print()
                 return
 
-            os.environ["BROWSER_CDP_URL"] = cdp_url
-            # Eagerly start the CDP supervisor so pending_dialogs + frame_tree
-            # show up in the next browser_snapshot.  No-op if already started.
+            # Reap any existing browser sessions only after we've proven the
+            # replacement endpoint is reachable.
             try:
-                from tools.browser_tool import _ensure_cdp_supervisor  # type: ignore[import-not-found]
+                from tools.browser_tool import cleanup_all_browsers
+
+                cleanup_all_browsers()
+            except Exception:
+                pass
+
+            os.environ["BROWSER_CDP_URL"] = cdp_url
+            # Mirror the gateway ordering: clean before and after publishing the
+            # new env so the next browser tool call cannot re-attach to a stale
+            # supervisor between steps.
+            try:
+                from tools.browser_tool import (  # type: ignore[import-not-found]
+                    _ensure_cdp_supervisor,
+                    cleanup_all_browsers,
+                )
+
+                cleanup_all_browsers()
                 _ensure_cdp_supervisor("default")
             except Exception:
                 pass

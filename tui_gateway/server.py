@@ -10413,27 +10413,11 @@ def _browser_connect(rid, params: dict) -> dict:
             ok = any(_http_ok(p, timeout=2.0) for p in probes)
 
             if not ok and _is_default_local_cdp(parsed):
-                from hermes_cli.browser_connect import try_launch_chrome_debug
-
-                announce(
-                    "Chromium-family browser isn't running with remote debugging — attempting to launch..."
+                for line in _failure_messages(url, port, system):
+                    announce(line, level="error")
+                return _ok(
+                    rid, {"connected": False, "url": url, "messages": messages}
                 )
-
-                if try_launch_chrome_debug(port, system):
-                    for _ in range(20):
-                        time.sleep(0.5)
-                        if any(_http_ok(p, timeout=1.0) for p in probes):
-                            ok = True
-                            break
-
-                if ok:
-                    announce(f"Chromium-family browser launched and listening on port {port}")
-                else:
-                    for line in _failure_messages(url, port, system)[1:]:
-                        announce(line, level="error")
-                    return _ok(
-                        rid, {"connected": False, "url": url, "messages": messages}
-                    )
             elif not ok:
                 return _err(rid, 5031, f"could not reach browser CDP at {url}")
             elif _is_default_local_cdp(parsed):
