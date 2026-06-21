@@ -105,13 +105,12 @@ class TestAuxiliaryMaxTokensParam:
 
 
 class TestBuildCallKwargsMaxTokens:
-    """_build_call_kwargs should not cap output by default (#34530).
+    """_build_call_kwargs should preserve explicit max_tokens intent.
 
-    Most chat-completions providers treat an omitted max_tokens as "use the
-    model max", which is what we want for auxiliary tasks. An explicit cap only
-    risks truncation or a wire-format 400 (GitHub Copilot / GPT-5 reject
-    max_tokens; ZAI vision rejects it entirely). The Anthropic Messages wire is
-    the one exception — max_tokens is a mandatory field there.
+    Auxiliary callers still omit max_tokens by default, but once a caller
+    explicitly computes a budget (for example compression's dynamic summary
+    limit) the wire kwargs should preserve that cap using the provider/model
+    specific parameter name. Retry logic covers endpoints that reject it.
     """
 
     @pytest.mark.parametrize(
@@ -126,7 +125,27 @@ class TestBuildCallKwargsMaxTokens:
             ("zai", "glm-4v-flash", "https://open.bigmodel.cn/api/paas/v4"),
         ],
     )
-    def test_omits_max_tokens_for_openai_compatible(self, provider, model, base_url):
+    def test_omits_max_tokens_when_no_cap_is_requested(self, provider, model, base_url):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider=provider,
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            base_url=base_url,
+        )
+        assert "max_tokens" not in kwargs
+        assert "max_completion_tokens" not in kwargs
+
+    @pytest.mark.parametrize(
+        "provider,model,base_url",
+        [
+            ("custom", "qwen", "http://localhost:8080/v1"),
+            ("openrouter", "anthropic/claude-sonnet-4.6", "https://openrouter.ai/api/v1"),
+            ("nous", "hermes-4", "https://inference-api.nousresearch.com/v1"),
+        ],
+    )
+    def test_keeps_explicit_max_tokens_for_openai_compatible(self, provider, model, base_url):
         from agent.auxiliary_client import _build_call_kwargs
 
         kwargs = _build_call_kwargs(
@@ -136,8 +155,28 @@ class TestBuildCallKwargsMaxTokens:
             max_tokens=1234,
             base_url=base_url,
         )
-        assert "max_tokens" not in kwargs
+        assert kwargs["max_tokens"] == 1234
         assert "max_completion_tokens" not in kwargs
+
+    @pytest.mark.parametrize(
+        "provider,model,base_url",
+        [
+            ("copilot", "gpt-5.4", "https://api.githubcopilot.com"),
+            ("custom", "gpt-5", "https://api.openai.com/v1"),
+        ],
+    )
+    def test_uses_max_completion_tokens_for_explicit_cap_on_openai_family(self, provider, model, base_url):
+        from agent.auxiliary_client import _build_call_kwargs
+
+        kwargs = _build_call_kwargs(
+            provider=provider,
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1234,
+            base_url=base_url,
+        )
+        assert kwargs["max_completion_tokens"] == 1234
+        assert "max_tokens" not in kwargs
 
     @pytest.mark.parametrize(
         "provider,model,base_url",

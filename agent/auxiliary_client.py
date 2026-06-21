@@ -4452,7 +4452,13 @@ def get_auxiliary_extra_body() -> dict:
     return _nous_extra_body() if auxiliary_is_nous else {}
 
 
-def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> dict:
+def auxiliary_max_tokens_param(
+    value: int,
+    *,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> dict:
     """Return the correct max tokens kwarg for the auxiliary client's provider.
 
     OpenRouter and local models use 'max_tokens'. Direct OpenAI with newer
@@ -4462,13 +4468,19 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
     fronting the newer families are also recognised — URL-only detection
     misses the case where a custom base URL serves e.g. ``gpt-5.4``.
     """
-    custom_base = _current_custom_base_url()
+    custom_base = base_url if base_url is not None else _current_custom_base_url()
+    if _is_anthropic_compat_endpoint(provider, custom_base):
+        return {"max_tokens": value}
+
     or_key = os.getenv("OPENROUTER_API_KEY")
+    direct_route = base_url is not None or provider is not None
     # Use max_completion_tokens for direct OpenAI-compatible providers that reject
     # max_tokens on newer GPT-4o/o-series/GPT-5-style models.
-    if (not or_key
-            and _read_nous_auth() is None
-            and base_url_hostname(custom_base) in {"api.openai.com", "api.githubcopilot.com"}):
+    if (
+        (direct_route or not or_key)
+        and _read_nous_auth() is None
+        and base_url_hostname(custom_base) in {"api.openai.com", "api.githubcopilot.com"}
+    ):
         return {"max_completion_tokens": value}
     # ...and for any caller serving a newer OpenAI-family model by name.
     if model_forces_max_completion_tokens(model):
@@ -5121,24 +5133,21 @@ def _build_call_kwargs(
         kwargs["temperature"] = temperature
 
     if max_tokens is not None:
-        # We do NOT cap output by default. Most chat-completions providers treat
-        # an omitted max_tokens as "use the model's max output", which is what we
-        # want for auxiliary tasks (compression summaries, titles, vision, etc.) —
-        # an explicit cap only risks truncating a summary or 400-ing on providers
-        # that reject the parameter outright (e.g. GitHub Copilot / newer OpenAI
-        # GPT-5 models require max_completion_tokens, not max_tokens; ZAI vision
-        # models reject it entirely with error 1210). Omitting it sidesteps all of
-        # those wire-format quirks at once.
-        #
-        # The one exception is the Anthropic Messages wire (MiniMax and any
-        # ``/anthropic`` endpoint reached through the OpenAI SDK wrapper), where
-        # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
-        # there.
+        # We still avoid capping output by default — this branch only runs when
+        # the caller explicitly requested a limit. Preserve that intent using
+        # the provider/model-specific wire key, then let the retry path below
+        # strip it if the endpoint rejects the parameter outright.
         _effective_base = base_url or (
             _current_custom_base_url() if provider == "custom" else ""
         )
-        if _is_anthropic_compat_endpoint(provider, _effective_base):
-            kwargs["max_tokens"] = max_tokens
+        kwargs.update(
+            auxiliary_max_tokens_param(
+                max_tokens,
+                model=model,
+                provider=provider,
+                base_url=_effective_base,
+            )
+        )
 
     if tools:
         # Defensive dedup: providers like Google Vertex, Azure, and Bedrock
