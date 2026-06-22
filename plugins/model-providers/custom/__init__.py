@@ -1,28 +1,66 @@
-"""Custom / Ollama (local) provider profile.
+"""Custom / Ollama provider profile.
 
 Covers any endpoint registered as provider="custom", including local
-Ollama instances. Key quirks:
+Ollama instances and named custom OpenAI-compatible gateways. Key quirks:
   - ollama_num_ctx → extra_body.options.num_ctx (local context window)
-  - reasoning_config disabled → extra_body.think = False
+  - local Ollama reasoning disabled → extra_body.think = False
+  - ai.input.im GLM / DeepSeek reasoning → top-level reasoning_effort
 """
 
+from __future__ import annotations
+
+from urllib.parse import urlparse
 from typing import Any
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
 
+_INPUT_IM_HOSTS = {"ai.input.im", "input.im"}
+_INPUT_IM_REASONING_MODELS = (
+    "glm-",
+    "z-ai/glm-",
+    "deepseek-",
+    "deepseek/",
+)
+
+
+def _flat_model_name(model: str | None) -> str:
+    return (model or "").strip().rsplit("/", 1)[-1].lower()
+
+
+def _normalize_reasoning_effort(effort: str) -> str | None:
+    effort = (effort or "").strip().lower()
+    if effort in {"none", "minimal", "low", "medium", "high"}:
+        return effort
+    if effort in {"xhigh", "max"}:
+        return "max"
+    return None
+
+
+def _is_input_im_reasoning_route(base_url: str | None, model: str | None) -> bool:
+    parsed = urlparse((base_url or "").strip())
+    host = (parsed.hostname or "").strip().lower()
+    if host not in _INPUT_IM_HOSTS:
+        return False
+    flat = _flat_model_name(model)
+    return flat.startswith(("glm-", "deepseek-"))
+
+
 class CustomProfile(ProviderProfile):
-    """Custom/Ollama local provider — think=false and num_ctx support."""
+    """Custom provider - Ollama local quirks plus relay-specific reasoning."""
 
     def build_api_kwargs_extras(
         self,
         *,
         reasoning_config: dict | None = None,
         ollama_num_ctx: int | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
         **ctx: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
+        top_level: dict[str, Any] = {}
 
         # Ollama context window
         if ollama_num_ctx:
@@ -30,14 +68,25 @@ class CustomProfile(ProviderProfile):
             options["num_ctx"] = ollama_num_ctx
             extra_body["options"] = options
 
-        # Disable thinking when reasoning is turned off
         if reasoning_config and isinstance(reasoning_config, dict):
-            _effort = (reasoning_config.get("effort") or "").strip().lower()
             _enabled = reasoning_config.get("enabled", True)
+            _effort = (reasoning_config.get("effort") or "").strip().lower()
+
+            # input-im's GLM / DeepSeek relay honors top-level reasoning_effort,
+            # while thinking/think toggles are ignored or inconsistently applied.
+            if _is_input_im_reasoning_route(base_url, model):
+                normalized = _normalize_reasoning_effort(
+                    "none" if _enabled is False else _effort
+                )
+                if normalized:
+                    top_level["reasoning_effort"] = normalized
+                return extra_body, top_level
+
+            # Local Ollama-style endpoints still use the binary think flag.
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
 
-        return extra_body, {}
+        return extra_body, top_level
 
     def fetch_models(
         self,

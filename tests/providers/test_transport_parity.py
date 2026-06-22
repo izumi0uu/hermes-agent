@@ -291,3 +291,38 @@ class TestCustomOllamaParity:
             reasoning_config={"enabled": False, "effort": "none"},
         )
         assert kw["extra_body"]["think"] is False
+
+    def test_input_im_glm_reasoning_effort_top_level(self, transport):
+        kw = transport.build_kwargs(
+            model="glm-5.2",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            base_url="https://ai.input.im/v1",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kw["reasoning_effort"] == "high"
+        assert "extra_body" not in kw or "think" not in kw.get("extra_body", {})
+
+    def test_input_im_deepseek_reasoning_disabled_uses_none(self, transport):
+        kw = transport.build_kwargs(
+            model="deepseek-v4-pro",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            base_url="https://ai.input.im/v1",
+            reasoning_config={"enabled": False},
+        )
+        assert kw["reasoning_effort"] == "none"
+        assert "extra_body" not in kw or "thinking" not in kw.get("extra_body", {})
+
+    def test_input_im_deepseek_xhigh_clamps_to_max(self, transport):
+        kw = transport.build_kwargs(
+            model="deepseek-v4-pro",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            base_url="https://ai.input.im/v1",
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+        )
+        assert kw["reasoning_effort"] == "max"

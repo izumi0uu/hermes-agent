@@ -487,3 +487,55 @@ class TestBaseProfile:
         eb, tl = p.build_api_kwargs_extras()
         assert eb == {}
         assert tl == {}
+
+
+class TestCustomProfile:
+    def test_ollama_disable_reasoning_uses_think_false(self):
+        p = get_provider_profile("custom")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="qwen3:72b",
+            base_url="http://127.0.0.1:11434/v1",
+        )
+        assert eb["think"] is False
+        assert tl == {}
+
+    def test_input_im_glm_uses_top_level_reasoning_effort(self):
+        p = get_provider_profile("custom")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="glm-5.2",
+            base_url="https://ai.input.im/v1",
+        )
+        assert eb == {}
+        assert tl == {"reasoning_effort": "high"}
+
+    def test_input_im_glm_disable_maps_to_none(self):
+        p = get_provider_profile("custom")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="glm-5.2",
+            base_url="https://ai.input.im/v1",
+        )
+        assert eb == {}
+        assert tl == {"reasoning_effort": "none"}
+
+    def test_input_im_deepseek_xhigh_maps_to_max(self):
+        p = get_provider_profile("custom")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            model="deepseek-v4-pro",
+            base_url="https://ai.input.im/v1",
+        )
+        assert eb == {}
+        assert tl == {"reasoning_effort": "max"}
+
+    def test_input_im_minimal_is_preserved(self):
+        p = get_provider_profile("custom")
+        eb, tl = p.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "minimal"},
+            model="deepseek-v4-pro",
+            base_url="https://ai.input.im/v1",
+        )
+        assert eb == {}
+        assert tl == {"reasoning_effort": "minimal"}
