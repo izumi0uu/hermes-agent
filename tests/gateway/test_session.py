@@ -610,6 +610,57 @@ class TestSessionStoreSwitchSession:
         assert resumed["end_reason"] is None
         db.close()
 
+    def test_switch_session_preserves_sticky_flag(self, tmp_path):
+        from hermes_state import SessionDB
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        )
+        current_entry = store.get_or_create_session(source)
+        store.set_sticky_no_auto_reset(current_entry.session_key, True)
+
+        target_session_id = "old_session_abc"
+        db.create_session(target_session_id, source="telegram", user_id="user-1")
+
+        switched = store.switch_session(current_entry.session_key, target_session_id)
+
+        assert switched is not None
+        assert switched.sticky_no_auto_reset is True
+        db.close()
+
+
+class TestSessionStoreResetSession:
+    def test_reset_session_clears_sticky_flag(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        store._db = None
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        )
+        entry = store.get_or_create_session(source)
+        store.set_sticky_no_auto_reset(entry.session_key, True)
+
+        reset_entry = store.reset_session(entry.session_key)
+
+        assert reset_entry is not None
+        assert reset_entry.sticky_no_auto_reset is False
+
 
 class TestSessionStoreLookupBySessionId:
     @pytest.fixture()

@@ -100,6 +100,21 @@ class TestShouldResetReason:
         source = _make_source()
         assert store._should_reset(entry, source) is None
 
+    def test_sticky_dm_blocks_idle_reset(self, tmp_path):
+        store = _make_store(
+            SessionResetPolicy(mode="idle", idle_minutes=30),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now() - timedelta(hours=2),
+            updated_at=datetime.now() - timedelta(hours=1),
+            sticky_no_auto_reset=True,
+        )
+        source = _make_source()
+        assert store._should_reset(entry, source) is None
+
 
 # ---------------------------------------------------------------------------
 # SessionEntry captures reason
@@ -277,3 +292,18 @@ class TestSessionEntryAutoResetRoundtrip:
         assert reloaded.was_auto_reset is False
         assert reloaded.auto_reset_reason is None
         assert reloaded.reset_had_activity is False
+
+    def test_sticky_flag_persists_across_roundtrip(self, tmp_path):
+        store = _make_store(tmp_path=tmp_path)
+        source = _make_source()
+
+        entry = store.get_or_create_session(source)
+        store.set_sticky_no_auto_reset(entry.session_key, True)
+
+        store._loaded = False
+        store._entries.clear()
+        store._ensure_loaded()
+
+        reloaded = store._entries.get(entry.session_key)
+        assert reloaded is not None
+        assert reloaded.sticky_no_auto_reset is True

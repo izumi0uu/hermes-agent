@@ -173,6 +173,18 @@ class TestCommandBypassActiveSession:
         assert any("handled:agents" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
+    async def test_sticky_bypasses_guard(self):
+        """/sticky must bypass so session pinning works mid-run."""
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event("/sticky on"))
+
+        assert sk not in adapter._pending_messages
+        assert any("handled:sticky" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
     async def test_tasks_alias_bypasses_guard(self):
         """/tasks alias must bypass active-session guard too."""
         adapter = _make_adapter()

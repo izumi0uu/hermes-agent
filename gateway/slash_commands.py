@@ -33,7 +33,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
-from gateway.session import SessionSource, build_session_key
+from gateway.session import SessionSource, build_session_key, is_private_chat_type
 from hermes_cli.config import cfg_get, clear_model_endpoint_credentials
 from utils import (
     atomic_json_write,
@@ -60,6 +60,91 @@ class GatewaySlashCommandsMixin:
         """
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
+
+    @staticmethod
+    def _sticky_scope_is_private(source: Optional[SessionSource]) -> bool:
+        """Return True when sticky sessions are supported for this source."""
+        return is_private_chat_type(getattr(source, "chat_type", None))
+
+    @staticmethod
+    def _sticky_state(session_entry: Any) -> str:
+        return "on" if bool(getattr(session_entry, "sticky_no_auto_reset", False)) else "off"
+
+    def _sticky_status_line(self, session_entry: Any, source: Optional[SessionSource]) -> str:
+        """Single-line sticky summary for /status output."""
+        state = self._sticky_state(session_entry)
+        if self._sticky_scope_is_private(source):
+            return f"**Sticky:** {state} — disables idle/daily auto-reset for this DM session"
+        return f"**Sticky:** {state} — private/DM only; group chats keep normal idle/daily reset rules"
+
+    def _sticky_status_text(
+        self,
+        session_entry: Any,
+        source: Optional[SessionSource],
+    ) -> str:
+        """Detailed sticky status for /sticky status replies."""
+        state = self._sticky_state(session_entry)
+        lines = [f"Sticky: {state}"]
+        if self._sticky_scope_is_private(source):
+            lines.append("Disables idle/daily auto-reset for this DM session.")
+            lines.append("Use /sticky off to disable it or /reset for a fresh non-sticky session.")
+        else:
+            lines.append("Private/DM only. Group chats keep normal idle/daily reset rules.")
+            lines.append("Use /reset for a fresh session.")
+        return "\n".join(lines)
+
+    def _set_sticky_no_auto_reset_for_source(
+        self,
+        source: SessionSource,
+        enabled: bool,
+    ):
+        """Create the session if needed and persist the sticky toggle."""
+        session_entry = self.session_store.get_or_create_session(source)
+        updated = self.session_store.set_sticky_no_auto_reset(
+            session_entry.session_key,
+            enabled,
+        )
+        return updated or session_entry
+
+    async def _maybe_auto_enable_sticky_for_obsidian(
+        self,
+        source: SessionSource,
+        *,
+        bundle_key: str | None = None,
+        skill_name: str | None = None,
+        loaded_skill_names: list[str] | None = None,
+    ) -> None:
+        """Auto-enable sticky for the dedicated Obsidian lane triggers."""
+        loaded = {name for name in (loaded_skill_names or []) if name}
+        should_enable = (
+            bundle_key == "/ob"
+            or skill_name == "obsidian-llm-wiki"
+            or "obsidian-llm-wiki" in loaded
+        )
+        if not should_enable:
+            return
+
+        if self._sticky_scope_is_private(source):
+            session_entry = self.session_store.get_or_create_session(source)
+            if not getattr(session_entry, "sticky_no_auto_reset", False):
+                self.session_store.set_sticky_no_auto_reset(
+                    session_entry.session_key,
+                    True,
+                )
+            return
+
+        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        if adapter is None:
+            return
+        try:
+            await adapter.send(
+                source.chat_id,
+                "Sticky sessions only auto-enable in private/DM chats. "
+                "This group chat will keep normal idle/daily reset rules.",
+                metadata=self._thread_metadata_for_source(source),
+            )
+        except Exception:
+            logger.debug("Failed to send sticky-scope notice", exc_info=True)
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
@@ -541,6 +626,7 @@ class GatewaySlashCommandsMixin:
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
+            self._sticky_status_line(session_entry, source),
         ])
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
@@ -566,6 +652,54 @@ class GatewaySlashCommandsMixin:
         ])
 
         return "\n".join(lines)
+
+    async def _handle_sticky_command(self, event: MessageEvent) -> str:
+        """Handle /sticky [on|off|status]."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        raw_args = (event.get_command_args() or "").strip()
+        parts = raw_args.split()
+        mode = parts[0].lower() if parts else "status"
+
+        if len(parts) > 1 or mode not in {"on", "off", "status"}:
+            return "Usage: /sticky [on|off|status]"
+
+        if mode == "status":
+            return self._sticky_status_text(session_entry, source)
+
+        if mode == "on" and not self._sticky_scope_is_private(source):
+            return (
+                "Sticky sessions can only be enabled in private/DM chats. "
+                "This chat will keep normal idle/daily reset rules."
+            )
+
+        was_enabled = bool(getattr(session_entry, "sticky_no_auto_reset", False))
+        session_entry = self._set_sticky_no_auto_reset_for_source(
+            source,
+            mode == "on",
+        )
+
+        if mode == "on":
+            prefix = "Sticky is already on." if was_enabled else "Sticky is now on."
+            return "\n".join(
+                [
+                    prefix,
+                    "Disables idle/daily auto-reset for this DM session.",
+                    "Use /sticky off to disable it or /reset for a fresh non-sticky session.",
+                ]
+            )
+
+        if self._sticky_scope_is_private(source):
+            prefix = "Sticky is already off." if not was_enabled else "Sticky is now off."
+            return "\n".join(
+                [
+                    prefix,
+                    "Idle/daily auto-reset is allowed again for this DM session.",
+                    "Use /reset for a fresh session immediately.",
+                ]
+            )
+
+        return self._sticky_status_text(session_entry, source)
 
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
