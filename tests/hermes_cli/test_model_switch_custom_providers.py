@@ -185,6 +185,63 @@ def test_switch_model_accepts_explicit_named_custom_provider(monkeypatch):
     assert result.api_key == "no-key-required"
 
 
+def test_switch_model_keeps_named_custom_provider_for_vendor_named_models(monkeypatch):
+    """Named custom gateways must not auto-hop to native vendors.
+
+    Regression: ``/model glm-5.2`` on a remote ``custom:input-im`` endpoint
+    switched to the native Z.AI provider because the current provider was not
+    recognized as "custom" unless it was the bare literal ``custom`` or a
+    localhost URL.
+    """
+    detect_calls = []
+
+    def _fake_detect(model_name, current_provider):
+        detect_calls.append((model_name, current_provider))
+        return ("zai", model_name)
+
+    monkeypatch.setattr("hermes_cli.model_switch.resolve_alias", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.list_provider_models", lambda *a, **k: [])
+    monkeypatch.setattr("hermes_cli.models.detect_provider_for_model", _fake_detect)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": "sk-input-im",
+            "base_url": "https://ai.input.im/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.models.validate_requested_model", lambda *a, **k: _MOCK_VALIDATION)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    result = switch_model(
+        raw_input="glm-5.2",
+        current_provider="custom:input-im",
+        current_model="gpt-5.4",
+        current_base_url="https://ai.input.im/v1",
+        current_api_key="sk-input-im",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "input-im",
+                "base_url": "https://ai.input.im/v1",
+                "model": "gpt-5.4",
+                "models": {
+                    "gpt-5.4": {},
+                    "glm-5.2": {},
+                },
+            }
+        ],
+    )
+
+    assert result.success is True
+    assert result.target_provider == "custom:input-im"
+    assert result.provider_label == "input-im"
+    assert result.new_model == "glm-5.2"
+    assert result.base_url == "https://ai.input.im/v1"
+    assert detect_calls == []
+
+
 def test_list_groups_same_name_custom_providers_into_one_row(monkeypatch):
     """Multiple custom_providers entries sharing a name should produce one row
     with all models collected, not N duplicate rows."""

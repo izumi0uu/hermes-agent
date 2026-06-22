@@ -617,6 +617,24 @@ def _resolve_alias_fallback(
     return None
 
 
+def _is_custom_routed_provider(provider: str, base_url: str = "") -> bool:
+    """Return True when model names should stay on the current endpoint.
+
+    Named custom providers (``custom:<name>``) often front multi-vendor model
+    gateways. Their model IDs can look like native vendor slugs (``glm-5.2``,
+    ``gpt-5.4``), so auto-detecting a different provider from the model name
+    would wrongly hop off the active endpoint and break auth.
+    """
+    provider_norm = (provider or "").strip().lower()
+    base = (base_url or "").lower()
+    return (
+        provider_norm in {"custom", "local"}
+        or provider_norm.startswith("custom:")
+        or "localhost" in base
+        or "127.0.0.1" in base
+    )
+
+
 def resolve_display_context_length(
     model: str,
     provider: str,
@@ -922,10 +940,7 @@ def switch_model(
                                 break
 
         # --- Step e: detect_provider_for_model() as last resort ---
-        _base = current_base_url or ""
-        is_custom = current_provider in {"custom", "local"} or (
-            "localhost" in _base or "127.0.0.1" in _base
-        )
+        is_custom = _is_custom_routed_provider(current_provider, current_base_url)
 
         if (
             target_provider == current_provider
