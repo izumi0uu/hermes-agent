@@ -245,6 +245,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info"),
+    CommandDef("safe-update", "Safely fast-forward the VPS custom Hermes branch when it is conflict-free", "Info",
+               gateway_only=True, aliases=("safe_update",)),
     CommandDef("version", "Show Hermes Agent version", "Info", aliases=("v",)),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info",
                args_hint="[nous|local]"),
@@ -379,6 +381,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "status",
         "steer",
         "stop",
+        "safe-update",
         "update",
         "version",
     }
@@ -1163,7 +1166,15 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - credits: the billing/top-up surface; reached via /hermes credits on Slack.
+#   - billing: the terminal-billing surface (buy/auto-reload/limit); /hermes billing.
+#   - moa: high-cost slash mode, available through /hermes moa to avoid
+#     displacing existing native Slack slash commands at the 50-command cap.
+#   - debug: the log/report upload surface; reached via /hermes debug on Slack.
+#   - safe-update: VPS operator command; direct slash stays available on
+#     other gateway surfaces, but Slack uses /hermes safe-update to preserve
+#     the native /version slot under the 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "safe-update"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
