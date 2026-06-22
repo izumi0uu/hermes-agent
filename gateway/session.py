@@ -27,6 +27,14 @@ def _now() -> datetime:
     return datetime.now()
 
 
+_PRIVATE_CHAT_TYPES = frozenset({"dm", "direct", "private"})
+
+
+def is_private_chat_type(chat_type: Optional[str]) -> bool:
+    """Return True when a chat type is a direct/private conversation."""
+    return str(chat_type or "dm").strip().lower() in _PRIVATE_CHAT_TYPES
+
+
 # ---------------------------------------------------------------------------
 # PII redaction helpers
 # ---------------------------------------------------------------------------
@@ -488,6 +496,7 @@ class SessionEntry:
     display_name: Optional[str] = None
     platform: Optional[Platform] = None
     chat_type: str = "dm"
+    sticky_no_auto_reset: bool = False
     
     # Token tracking
     input_tokens: int = 0
@@ -548,6 +557,7 @@ class SessionEntry:
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type,
+            "sticky_no_auto_reset": self.sticky_no_auto_reset,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cache_read_tokens": self.cache_read_tokens,
@@ -614,6 +624,7 @@ class SessionEntry:
             display_name=data.get("display_name"),
             platform=platform,
             chat_type=data.get("chat_type", "dm"),
+            sticky_no_auto_reset=data.get("sticky_no_auto_reset", False),
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             cache_read_tokens=data.get("cache_read_tokens", 0),
@@ -928,7 +939,12 @@ class SessionStore:
         
         if policy.mode == "none":
             return None
-        
+
+        if entry.sticky_no_auto_reset and is_private_chat_type(
+            source.chat_type or entry.chat_type
+        ):
+            return None
+
         now = _now()
         
         if policy.mode in {"idle", "both"}:
@@ -1154,6 +1170,23 @@ class SessionStore:
             self._save()
             return True
 
+    def set_sticky_no_auto_reset(
+        self,
+        session_key: str,
+        enabled: bool,
+    ) -> Optional[SessionEntry]:
+        """Persist the sticky idle/daily auto-reset toggle for one session lane."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            if entry.sticky_no_auto_reset == enabled:
+                return entry
+            entry.sticky_no_auto_reset = enabled
+            self._save()
+            return entry
+
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.
 
@@ -1275,6 +1308,7 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                sticky_no_auto_reset=False,
             )
 
             self._entries[session_key] = new_entry
@@ -1335,6 +1369,7 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                sticky_no_auto_reset=old_entry.sticky_no_auto_reset,
             )
 
             self._entries[session_key] = new_entry

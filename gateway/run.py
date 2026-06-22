@@ -7809,6 +7809,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _cmd_def_inner.name == "footer":
                     return await self._handle_footer_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "sticky":
+                return await self._handle_sticky_command(event)
+
             # Gateway-handled info/control commands with dedicated
             # running-agent handlers.
             if _cmd_def_inner and _cmd_def_inner.name in _DEDICATED_HANDLERS:
@@ -8085,6 +8088,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "sticky":
+            return await self._handle_sticky_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -8364,6 +8370,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         msg, _loaded, missing = bundle_result
                         event.text = msg
                         _bundle_handled = True
+                        await self._maybe_auto_enable_sticky_for_obsidian(
+                            source,
+                            bundle_key=bundle_key,
+                            loaded_skill_names=_loaded,
+                        )
                         if missing:
                             logger.info(
                                 "Bundle %s skipped missing skills: %s",
@@ -8402,6 +8413,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if msg:
                         event.text = msg
+                        await self._maybe_auto_enable_sticky_for_obsidian(
+                            source,
+                            skill_name=_skill_name,
+                        )
                         # Fall through to normal message processing with skill content
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
