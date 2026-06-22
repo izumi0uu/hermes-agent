@@ -2483,6 +2483,37 @@ class CLICommandsMixin:
         self._pending_relaunch = ["update"]
         return True
 
+    def _handle_safe_update_command(self) -> None:
+        """Handle /safe-update — run the VPS-safe custom update helper."""
+        import subprocess
+        from pathlib import Path
+
+        script_path = Path.home() / ".hermes" / "scripts" / "safe_update_hermes_vps.sh"
+        if not script_path.exists():
+            print(f"  ✗ Safe update script not found: {script_path}")
+            return
+
+        print()
+        print("  ⚕ Running safe update...")
+        print()
+
+        try:
+            result = subprocess.run(
+                ["bash", str(script_path)],
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        except Exception as exc:
+            print(f"  ✗ /safe-update failed to start: {exc}")
+            return
+
+        output = (result.stdout or result.stderr or "").strip()
+        if output:
+            print(output)
+        else:
+            print("  ✓ /safe-update finished with no additional output.")
+
     def _handle_voice_command(self, command: str):
         """Handle /voice [on|off|tts|status] command."""
         from cli import _cprint

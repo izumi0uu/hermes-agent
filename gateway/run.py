@@ -7821,6 +7821,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "safe-update":
+                    return await self._handle_safe_update_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
                 if _cmd_def_inner.name == "version":
@@ -8226,6 +8228,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "update":
             return await self._handle_update_command(event)
+
+        if canonical == "safe-update":
+            return await self._handle_safe_update_command(event)
 
         if canonical == "version":
             return await self._handle_version_command(event)

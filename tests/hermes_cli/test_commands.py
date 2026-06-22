@@ -25,6 +25,7 @@ from hermes_cli.commands import (
     slack_app_manifest,
     slack_native_slashes,
     slack_subcommand_map,
+    should_bypass_active_session,
     telegram_bot_commands,
     telegram_menu_commands,
 )
@@ -105,6 +106,7 @@ class TestResolveCommand:
         assert resolve_command("reset").name == "new"
         assert resolve_command("q").name == "queue"
         assert resolve_command("exit").name == "quit"
+        assert resolve_command("safe_update").name == "safe-update"
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
@@ -215,6 +217,15 @@ class TestGatewayHelpLines:
         bg_line = [l for l in lines if "/background" in l]
         assert len(bg_line) == 1
         assert "/bg" in bg_line[0]
+
+    def test_includes_safe_update_command(self):
+        lines = gateway_help_lines()
+        assert any("`/safe-update`" in line for line in lines)
+
+
+class TestActiveSessionBypass:
+    def test_safe_update_bypasses_active_session(self):
+        assert should_bypass_active_session("safe-update") is True
 
 
 class TestTelegramBotCommands:

@@ -8023,6 +8023,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         elif canonical == "update":
             if self._handle_update_command():
                 return False
+        elif canonical == "safe-update":
+            self._handle_safe_update_command()
         elif canonical == "version":
             from hermes_cli.main import _print_version_info
 

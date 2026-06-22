@@ -4174,3 +4174,52 @@ class GatewaySlashCommandsMixin:
 
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")
+
+    async def _handle_safe_update_command(self, event: MessageEvent) -> str:
+        """Handle /safe-update — run the custom VPS-safe update script.
+
+        Unlike `/update`, this command is intentionally narrow: it runs the
+        operator-maintained `~/.hermes/scripts/safe_update_hermes_vps.sh`
+        helper, which only fast-forwards the custom VPS branch when the tree is
+        clean and the tracking branch is strictly ahead. Any divergence or
+        upstream-integration requirement becomes a notification-only result.
+        """
+        platform = event.source.platform
+        _allowed = self._UPDATE_ALLOWED_PLATFORMS
+        if platform not in _allowed:
+            try:
+                from gateway.platform_registry import platform_registry
+                entry = platform_registry.get(platform.value)
+                if not entry or not entry.allow_update_command:
+                    return t("gateway.update.platform_not_messaging")
+            except Exception:
+                return t("gateway.update.platform_not_messaging")
+
+        script_path = Path.home() / ".hermes" / "scripts" / "safe_update_hermes_vps.sh"
+        if not script_path.exists():
+            return f"✗ 找不到安全更新脚本：`{script_path}`"
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bash",
+                str(script_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=dict(os.environ, PYTHONUNBUFFERED="1"),
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
+        except asyncio.TimeoutError:
+            return "❌ /safe-update 超时（15 分钟）。请稍后查看 VPS 状态。"
+        except Exception as exc:
+            return f"❌ /safe-update 启动失败：{exc}"
+
+        output = (stdout or b"").decode("utf-8", errors="replace").strip()
+        if not output:
+            output = "✅ /safe-update 已执行完毕，没有需要汇报的变更。"
+
+        from gateway.run import _telegramize_command_mentions
+
+        return _telegramize_command_mentions(
+            output,
+            getattr(getattr(event, "source", None), "platform", None),
+        )
