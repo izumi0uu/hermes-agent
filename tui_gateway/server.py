@@ -4946,6 +4946,62 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
     return None
 
 
+def deliver_live_system_message(session_key: str, text: str) -> bool:
+    """Surface an out-of-band system line inside a live TUI/desktop session.
+
+    Cron deliveries and similar background events are not agent turns, so they
+    must not arrive as assistant text that would create assistant-to-assistant
+    transcript seams.  Emit them through the existing ``review.summary`` system
+    line path instead.  When the session is idle we also persist the message in
+    the backend history/DB so a later resume still shows it.  When the session
+    is mid-turn we skip the history mutation to avoid invalidating that turn's
+    ``history_version`` snapshot; the live UI still receives the system line.
+    """
+    key = str(session_key or "").strip()
+    body = str(text or "")
+    if not key or not body.strip():
+        return False
+
+    live = _find_live_session_by_key(key)
+    if live is None:
+        return False
+
+    sid, session = live
+    persisted = False
+    entry = {"role": "system", "content": body}
+
+    lock = session.get("history_lock")
+    if lock is not None:
+        with lock:
+            if not session.get("running"):
+                session.setdefault("history", []).append(entry)
+                session["history_version"] = int(session.get("history_version", 0)) + 1
+                persisted = True
+    elif not session.get("running"):
+        session.setdefault("history", []).append(entry)
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        persisted = True
+
+    if persisted:
+        try:
+            agent = session.get("agent")
+            db = getattr(agent, "_session_db", None) if agent is not None else None
+            if db is not None:
+                db.append_message(session_id=key, role="system", content=body)
+            else:
+                _ensure_session_db_row(session)
+                with _session_db(session) as scoped_db:
+                    if scoped_db is not None:
+                        scoped_db.append_message(
+                            session_id=key, role="system", content=body
+                        )
+        except Exception:
+            logger.debug("failed to persist live system message", exc_info=True)
+
+    _emit("review.summary", sid, {"text": body})
+    return True
+
+
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:

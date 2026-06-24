@@ -99,6 +99,50 @@ def test_init_session_attaches_background_review_callback(server, monkeypatch):
     }
 
 
+def test_deliver_live_system_message_appends_history_and_emits_review_summary(
+    server, monkeypatch
+):
+    monkeypatch.setattr(server, "_SlashWorker", lambda *a, **kw: object())
+    monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": "m"})
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+
+    captured_emits: list = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: captured_emits.append((event, sid, payload)),
+    )
+
+    fake_db = MagicMock()
+
+    class FakeAgent:
+        model = "fake/model"
+        _session_db = fake_db
+
+    server._init_session("sid-abc", "session-key", FakeAgent(), [], cols=80)
+    captured_emits.clear()
+
+    assert server.deliver_live_system_message("session-key", "Cron output ready") is True
+
+    session = server._sessions["sid-abc"]
+    assert session["history"][-1] == {"role": "system", "content": "Cron output ready"}
+    assert captured_emits == [
+        ("review.summary", "sid-abc", {"text": "Cron output ready"})
+    ]
+    fake_db.append_message.assert_called_once_with(
+        session_id="session-key",
+        role="system",
+        content="Cron output ready",
+    )
+
+
+def test_deliver_live_system_message_returns_false_without_live_session(server):
+    assert server.deliver_live_system_message("missing-session", "Cron output ready") is False
+
+
 def test_review_summary_callback_survives_agent_without_attribute(server, monkeypatch):
     """If the agent is a bare object that doesn't allow attribute
     assignment (e.g. some stubbed test double), _init_session must not
@@ -164,4 +208,3 @@ def test_load_memory_notifications_normalization(server, monkeypatch, raw, expec
     display = {} if raw is None else {"memory_notifications": raw}
     monkeypatch.setattr(server, "_load_cfg", lambda: {"display": display})
     assert server._load_memory_notifications() == expected
-

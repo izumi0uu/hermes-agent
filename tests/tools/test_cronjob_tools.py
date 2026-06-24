@@ -4,6 +4,7 @@ import json
 import pytest
 
 from tools.cronjob_tools import (
+    _origin_from_env,
     _scan_cron_prompt,
     check_cronjob_requirements,
     cronjob,
@@ -177,6 +178,31 @@ class TestScanCronSkillAssembled:
         assert _scan_cron_skill_assembled(
             'curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user'
         )[1] == ""
+
+
+class TestOriginFromEnv:
+    def test_tui_session_key_falls_back_to_tui_origin(self, monkeypatch):
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_KEY", "tui-session-abc")
+
+        assert _origin_from_env() == {
+            "platform": "tui",
+            "chat_id": "tui-session-abc",
+            "chat_name": None,
+            "thread_id": None,
+        }
+
+    def test_session_id_alone_does_not_look_like_tui_origin(self, monkeypatch):
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_ID", "cli-session-123")
+
+        assert _origin_from_env() is None
 
 
 class TestCronjobRequirements:

@@ -551,6 +551,40 @@ class TestRoutingIntents:
             assert platforms == ["discord", "telegram"], f"token={token!r} -> {platforms}"
 
 
+class TestTuiDelivery:
+    def test_origin_delivery_to_tui_uses_live_session_helper(self):
+        job = {
+            "id": "tui-job",
+            "name": "daily-report",
+            "deliver": "origin",
+            "origin": {"platform": "tui", "chat_id": "tui-session-abc"},
+        }
+
+        with patch("cron.scheduler._deliver_to_tui_session", return_value=True) as deliver_tui, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            result = _deliver_result(job, "Here is today's summary.")
+
+        assert result is None
+        deliver_tui.assert_called_once()
+        session_key, sent_content = deliver_tui.call_args.args
+        assert session_key == "tui-session-abc"
+        assert "Cronjob Response: daily-report" in sent_content
+        assert "Here is today's summary." in sent_content
+        send_mock.assert_not_called()
+
+    def test_tui_delivery_reports_missing_live_session(self):
+        job = {
+            "id": "tui-job",
+            "deliver": "origin",
+            "origin": {"platform": "tui", "chat_id": "tui-session-abc"},
+        }
+
+        with patch("cron.scheduler._deliver_to_tui_session", return_value=False):
+            result = _deliver_result(job, "Output.")
+
+        assert result == "tui session 'tui-session-abc' is not live"
+
+
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
 

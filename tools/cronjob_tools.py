@@ -295,6 +295,17 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
             "thread_id": thread_id,
         }
+    # TUI/desktop sessions intentionally leave platform/chat_id empty. The
+    # live session key is the only safe local fallback here; HERMES_SESSION_ID
+    # is broader and would misclassify plain CLI runs as deliverable origins.
+    session_key = get_session_env("HERMES_SESSION_KEY")
+    if session_key:
+        return {
+            "platform": "tui",
+            "chat_id": session_key,
+            "chat_name": None,
+            "thread_id": None,
+        }
     return None
 
 

@@ -764,6 +764,23 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _deliver_to_tui_session(session_key: str, content: str) -> bool:
+    """Deliver cron output into a live TUI/desktop session, if one exists."""
+    key = str(session_key or "").strip()
+    if not key:
+        return False
+    try:
+        from tui_gateway.server import deliver_live_system_message
+    except Exception:
+        logger.debug("TUI delivery helper unavailable for session %s", key, exc_info=True)
+        return False
+    try:
+        return bool(deliver_live_system_message(key, content))
+    except Exception:
+        logger.warning("TUI delivery to %s failed", key, exc_info=True)
+        return False
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -797,9 +814,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
 
-    from tools.send_message_tool import _send_to_platform
-    from gateway.config import load_gateway_config, Platform
-
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
@@ -828,19 +842,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
-    try:
-        config = load_gateway_config()
-    except Exception as e:
-        msg = f"failed to load gateway config: {e}"
-        logger.error("Job '%s': %s", job["id"], msg)
-        return msg
+    from tools.send_message_tool import _send_to_platform
 
+    config = None
+    Platform = None
     delivery_errors = []
 
     for target in targets:
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        if str(platform_name).lower() == "tui":
+            if _deliver_to_tui_session(str(chat_id), delivery_content):
+                logger.info("Job '%s': delivered to tui session %s", job["id"], chat_id)
+            else:
+                msg = f"tui session '{chat_id}' is not live"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+            continue
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -856,6 +876,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 "Job '%s': delivering to %s:%s thread_id=%s",
                 job["id"], platform_name, chat_id, thread_id,
             )
+
+        if config is None or Platform is None:
+            try:
+                from gateway.config import load_gateway_config, Platform as GatewayPlatform
+
+                config = load_gateway_config()
+                Platform = GatewayPlatform
+            except Exception as e:
+                msg = f"failed to load gateway config: {e}"
+                logger.error("Job '%s': %s", job["id"], msg)
+                return msg
 
         # Built-in names resolve to their enum member; plugin platform names
         # create dynamic members via Platform._missing_().
