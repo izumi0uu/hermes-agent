@@ -858,25 +858,48 @@ def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, st
        ``normalize_model_for_provider`` (e.g. ``anthropic/claude-opus-4.6``
        on native anthropic → ``claude-opus-4-6``).
     """
+    from hermes_cli.config import get_compatible_custom_providers, load_config
     from hermes_cli.models import _KNOWN_PROVIDER_NAMES, normalize_provider
     from hermes_cli.model_normalize import normalize_model_for_provider
+    from hermes_cli.providers import custom_provider_slug, resolve_custom_provider
 
     prov_in = (provider or "").strip()
     model_in = (model or "").strip()
     canonical = normalize_provider(prov_in)
 
+    try:
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+
+    custom_provider = resolve_custom_provider(
+        prov_in,
+        get_compatible_custom_providers(cfg),
+    )
+    if custom_provider is not None:
+        prov_in = custom_provider.id
+        canonical = custom_provider.id
+
     if canonical not in _KNOWN_PROVIDER_NAMES and "/" in model_in:
+        if canonical.startswith("custom:"):
+            return canonical, model_in
+
+        custom_slug = custom_provider_slug(prov_in) if prov_in else ""
+        custom_provider = resolve_custom_provider(
+            custom_slug,
+            get_compatible_custom_providers(cfg),
+        )
+        if custom_provider is not None:
+            return custom_provider.id, model_in
+
         # Vendor prefix posing as a provider (analytics fallback). Resolve
         # against the user's current provider when it's an aggregator that
         # serves vendor-prefixed slugs; otherwise default to openrouter.
-        try:
-            cur_cfg = load_config().get("model", {})
-            cur_provider = (
-                str(cur_cfg.get("provider", "") or "").strip().lower()
-                if isinstance(cur_cfg, dict) else ""
-            )
-        except Exception:
-            cur_provider = ""
+        cur_cfg = cfg.get("model", {})
+        cur_provider = (
+            str(cur_cfg.get("provider", "") or "").strip().lower()
+            if isinstance(cur_cfg, dict) else ""
+        )
         from hermes_cli.models import _AGGREGATOR_PROVIDERS
         if cur_provider and normalize_provider(cur_provider) in _AGGREGATOR_PROVIDERS:
             canonical = normalize_provider(cur_provider)

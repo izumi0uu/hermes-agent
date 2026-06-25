@@ -1483,6 +1483,83 @@ class TestWebServerEndpoints:
         assert data["provider"] == "openrouter"
         assert data["model"] == "moonshotai/kimi-k2.6"
 
+    def test_model_set_keeps_named_custom_provider_slug(self, monkeypatch):
+        """A named custom provider slug from the dashboard must survive
+        `/api/model/set` unchanged instead of falling into the unknown-provider
+        OpenRouter fallback."""
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.config import load_config, save_config
+        cfg = load_config()
+        cfg["model"] = {"provider": "openrouter", "default": "openai/gpt-5.5"}
+        cfg["custom_providers"] = [
+            {
+                "name": "US Azure",
+                "base_url": "http://127.0.0.1:18025/v1",
+                "api_key": "x",
+                "models": ["us/azure/openai/gpt-5.5"],
+            }
+        ]
+        save_config(cfg)
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "custom:us-azure",
+                "model": "us/azure/openai/gpt-5.5",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["provider"] == "custom:us-azure"
+        assert data["model"] == "us/azure/openai/gpt-5.5"
+
+        cfg = load_config()
+        assert cfg["model"]["provider"] == "custom:us-azure"
+        assert cfg["model"]["default"] == "us/azure/openai/gpt-5.5"
+
+    def test_model_set_resolves_named_custom_provider_display_name(self, monkeypatch):
+        """A bare named custom provider from UI state should canonicalize to
+        the stored `custom:<name>` slug so runtime resolution stays routable."""
+        monkeypatch.setattr(
+            "hermes_cli.model_cost_guard.expensive_model_warning",
+            lambda *_args, **_kwargs: None,
+        )
+        from hermes_cli.config import load_config, save_config
+        cfg = load_config()
+        cfg["model"] = {"provider": "openrouter", "default": "openai/gpt-5.5"}
+        cfg["custom_providers"] = [
+            {
+                "name": "US Azure",
+                "base_url": "http://127.0.0.1:18025/v1",
+                "api_key": "x",
+                "models": ["us/azure/openai/gpt-5.5"],
+            }
+        ]
+        save_config(cfg)
+
+        resp = self.client.post(
+            "/api/model/set",
+            json={
+                "scope": "main",
+                "provider": "us-azure",
+                "model": "us/azure/openai/gpt-5.5",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["provider"] == "custom:us-azure"
+        assert data["model"] == "us/azure/openai/gpt-5.5"
+
+        cfg = load_config()
+        assert cfg["model"]["provider"] == "custom:us-azure"
+        assert cfg["model"]["default"] == "us/azure/openai/gpt-5.5"
+
     def test_model_set_keeps_aggregator_slug_unchanged(self, monkeypatch):
         """The happy path (picker → openrouter + vendor/model) is untouched."""
         monkeypatch.setattr(
