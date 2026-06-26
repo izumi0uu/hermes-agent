@@ -14,6 +14,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.platforms.base import MessageType
 
 
 def _make_source() -> SessionSource:
@@ -28,6 +29,18 @@ def _make_source() -> SessionSource:
 
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
+
+
+def _make_voice_event(text: str = "voice_message_1.ogg") -> MessageEvent:
+    source = _make_source()
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.VOICE,
+        source=source,
+        message_id="m1",
+        media_urls=["/tmp/voice_message_1.ogg"],
+        media_types=["audio/ogg"],
+    )
 
 
 def _make_runner():
@@ -76,6 +89,7 @@ def _make_runner():
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
+    runner._prepare_clarify_reply_text = AsyncMock(return_value="transcribed voice reply")
     return runner
 
 
@@ -168,6 +182,45 @@ async def test_underscored_alias_for_hyphenated_builtin_not_flagged(monkeypatch)
     # Whatever /reload_mcp returns, it must not be the unknown-command guard.
     if result is not None:
         assert "Unknown command" not in result
+
+
+@pytest.mark.asyncio
+async def test_pending_clarify_voice_reply_uses_transcription(monkeypatch):
+    """Voice replies to pending clarify should resolve with transcript text."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    session_key = build_session_key(_make_source())
+    pending = SimpleNamespace(clarify_id="clarify-1")
+    runner.hooks.emit_collect = AsyncMock(return_value=[])
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    monkeypatch.setattr(
+        "tools.clarify_gateway.get_pending_for_session",
+        lambda _sk: pending if _sk == session_key else None,
+    )
+    resolved = {}
+
+    def _resolve(clarify_id, response):
+        resolved["clarify_id"] = clarify_id
+        resolved["response"] = response
+        return True
+
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_gateway_clarify",
+        _resolve,
+    )
+
+    result = await runner._handle_message(_make_voice_event())
+
+    assert result == ""
+    runner._prepare_clarify_reply_text.assert_awaited_once()
+    assert resolved == {
+        "clarify_id": "clarify-1",
+        "response": "transcribed voice reply",
+    }
 
 
 # ------------------------------------------------------------------

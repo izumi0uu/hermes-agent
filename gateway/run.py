@@ -7908,6 +7908,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
+                _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
                 _resolved = _clarify_mod.resolve_gateway_clarify(
                     _pending_clarify.clarify_id, _raw_clarify_reply,
                 )
@@ -9333,6 +9334,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("@ context reference expansion failed: %s", exc)
 
         return message_text
+
+    async def _prepare_clarify_reply_text(self, event) -> str:
+        """Normalize a pending clarify reply before resolving it."""
+        if getattr(event, "message_type", None) != MessageType.VOICE:
+            return (event.text or "").strip()
+
+        audio_paths: List[str] = []
+        media_urls = getattr(event, "media_urls", None) or []
+        media_types = getattr(event, "media_types", None) or []
+        for i, path in enumerate(media_urls):
+            mtype = media_types[i] if i < len(media_types) else ""
+            if (
+                mtype.startswith("audio/")
+                or getattr(event, "message_type", None) == MessageType.VOICE
+            ) and path:
+                audio_paths.append(path)
+
+        if not audio_paths:
+            return (event.text or "").strip()
+
+        enriched_text, _successful_transcripts = await self._enrich_message_with_transcription(
+            "",
+            audio_paths,
+            include_audio_path_notes=False,
+        )
+        return enriched_text.strip()
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -13441,6 +13468,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         audio_paths: List[str],
+        *,
+        include_audio_path_notes: bool = True,
     ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -13464,12 +13493,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
                 duration_str = await _probe_audio_duration(abs_path)
+                prefix = "[The user sent a voice message"
+                if include_audio_path_notes:
+                    prefix += f": {abs_path}"
                 if duration_str:
-                    notes.append(
-                        f"[The user sent a voice message: {abs_path} (duration: {duration_str})]"
-                    )
+                    notes.append(f"{prefix} (duration: {duration_str})]")
                 else:
-                    notes.append(f"[The user sent a voice message: {abs_path}]")
+                    notes.append(f"{prefix}]")
             if not notes:
                 return user_text, []
             prefix = "\n\n".join(notes)
