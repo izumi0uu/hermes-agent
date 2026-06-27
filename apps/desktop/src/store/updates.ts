@@ -17,7 +17,8 @@ import { checkHermesUpdate, getActionStatus, updateHermes } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { persistString, storedString } from '@/lib/storage'
 import { dismissNotification, notify } from '@/store/notifications'
-import { $connection } from '@/store/session'
+import { $connection, $workingSessionIds } from '@/store/session'
+import { $subagentsBySession, activeSubagentCount } from '@/store/subagents'
 import type { BackendUpdateCheckResponse } from '@/types/hermes'
 
 export interface UpdateApplyState {
@@ -321,11 +322,34 @@ export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
   }
 }
 
+function hasActiveClientUpdateWork(): boolean {
+  return (
+    $workingSessionIds.get().length > 0 ||
+    Object.values($subagentsBySession.get()).some(items => activeSubagentCount(items) > 0)
+  )
+}
+
 export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promise<DesktopUpdateApplyResult> {
   const bridge = window.hermesDesktop?.updates
 
   if (!bridge) {
     return { ok: false, error: 'unavailable', message: 'Desktop bridge unavailable.' }
+  }
+
+  // The in-app client updater tears down the local backend pool as part of the
+  // handoff. Refuse to start while any local session or background subagent is
+  // still running so we don't kill active work out from under the user.
+  if (!isRemoteMode() && hasActiveClientUpdateWork()) {
+    const message = translateNow('updates.activeWorkBody')
+    $updateApply.set({
+      ...IDLE,
+      applying: false,
+      stage: 'blocked',
+      error: 'active-work',
+      message
+    })
+
+    return { ok: false, error: 'active-work', message }
   }
 
   dismissNotification(UPDATE_TOAST_ID)
@@ -573,6 +597,7 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
   const log = [...current.log, { stage: payload.stage, message: payload.message, at: payload.at }].slice(-50)
 
   const terminal =
+    payload.stage === 'blocked' ||
     payload.stage === 'error' ||
     payload.stage === 'restart' ||
     payload.stage === 'manual' ||

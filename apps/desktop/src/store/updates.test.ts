@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopUpdateStatus } from '@/global'
+import type { SubagentProgress } from '@/store/subagents'
 
 const storage = new Map<string, string>()
 
@@ -55,6 +56,8 @@ const {
 } = await import('./updates')
 
 const { setConnection } = await import('./session')
+const { $subagentsBySession } = await import('./subagents')
+const { setWorkingSessionIds } = await import('./session')
 
 const status = (over: Partial<DesktopUpdateStatus> = {}): DesktopUpdateStatus => ({
   supported: true,
@@ -253,12 +256,29 @@ describe('checkBackendUpdates', () => {
 describe('applyUpdates terminal state', () => {
   const applyMock = vi.fn()
 
+  const runningSubagent = (over: Partial<SubagentProgress> = {}): SubagentProgress => ({
+    id: 'subagent-1',
+    parentId: null,
+    goal: 'Investigate',
+    status: 'running',
+    taskCount: 1,
+    taskIndex: 0,
+    startedAt: 1,
+    updatedAt: 1,
+    filesRead: [],
+    filesWritten: [],
+    stream: [],
+    ...over
+  })
+
   beforeEach(() => {
     storage.clear()
     notifySpy.mockClear()
     dismissSpy.mockClear()
     applyMock.mockReset()
     resetUpdateApplyState()
+    setWorkingSessionIds(() => [])
+    $subagentsBySession.set({})
     $updateOverlayOpen.set(true)
     ;(globalThis as unknown as { window: unknown }).window = {
       hermesDesktop: { updates: { apply: applyMock } }
@@ -280,6 +300,28 @@ describe('applyUpdates terminal state', () => {
     expect($updateApply.get().applying).toBe(true)
     expect($updateOverlayOpen.get()).toBe(true)
     expect(notifySpy).not.toHaveBeenCalled()
+  })
+
+  it('refuses to start the desktop updater while a local session is still running', async () => {
+    setWorkingSessionIds(() => ['session-1'])
+
+    const result = await applyUpdates()
+
+    expect(result).toMatchObject({ ok: false, error: 'active-work' })
+    expect(applyMock).not.toHaveBeenCalled()
+    expect($updateApply.get().applying).toBe(false)
+    expect($updateApply.get().stage).toBe('blocked')
+    expect($updateApply.get().message).toMatch(/still running a chat/i)
+  })
+
+  it('refuses to start the desktop updater while background subagents are still running', async () => {
+    $subagentsBySession.set({ 'session-1': [runningSubagent()] })
+
+    const result = await applyUpdates()
+
+    expect(result).toMatchObject({ ok: false, error: 'active-work' })
+    expect(applyMock).not.toHaveBeenCalled()
+    expect($updateApply.get().stage).toBe('blocked')
   })
 
   it('closes the overlay + toasts when updated but not relaunched in place', async () => {

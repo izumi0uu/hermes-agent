@@ -341,6 +341,9 @@ export type DesktopUpdateStage =
    *  changed — the user must update/reinstall the desktop app. Terminal,
    *  closeable; never claims the GUI was updated. (#45205) */
   | 'guiSkew'
+  /** Local work is still running, so the desktop updater must wait until the
+   *  active session and background workers settle. */
+  | 'blocked'
   | 'error'
 
 export interface DesktopUpdateProgress {
