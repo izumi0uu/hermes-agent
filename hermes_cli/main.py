@@ -8989,9 +8989,24 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # against.
         branch = _resolve_update_branch(args)
 
+        # Installer-managed clones are shallow (`git clone --depth 1`).
+        # Keep fetches shallow so update checks do not silently unshallow the
+        # repo before we decide whether an exact commit count is trustworthy.
+        is_shallow = (
+            subprocess.run(
+                git_cmd + ["rev-parse", "--is-shallow-repository"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            == "true"
+        )
+        depth_args = ["--depth", "1"] if is_shallow else []
+
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch"] + depth_args + ["origin", branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -9078,15 +9093,37 @@ def _cmd_update_impl(args, gateway_mode: bool):
             and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty()))
         )
 
-        # Check if there are updates
-        result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit_count = int(result.stdout.strip())
+        # Managed installer checkouts are shallow (`git clone --depth 1`).
+        # Counting across that boundary can yield a huge bogus "behind" value,
+        # so preserve the existing `--check` behavior here: compare tip SHAs
+        # and treat the result as presence-only instead of an exact count.
+        commit_count = None
+        if is_shallow:
+            head_sha = subprocess.run(
+                git_cmd + ["rev-parse", "HEAD"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            target_sha = subprocess.run(
+                git_cmd + ["rev-parse", f"origin/{branch}"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            if head_sha and target_sha and head_sha == target_sha:
+                commit_count = 0
+        else:
+            result = subprocess.run(
+                git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            commit_count = int(result.stdout.strip())
 
         if commit_count == 0:
             _invalidate_update_cache()
@@ -9116,7 +9153,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
+        if commit_count is None:
+            print(f"→ Update available (behind origin/{branch}).")
+        else:
+            print(f"→ Found {commit_count} new commit(s)")
 
         # Snapshot critical state (state.db, config, pairing JSONs, etc.)
         # before pulling so a user can recover if something goes wrong.
