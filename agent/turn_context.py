@@ -436,8 +436,9 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
-    # Per-turn file-mutation verifier state.
+    # Per-turn verifier state.
     agent._turn_failed_file_mutations = {}
+    agent._turn_failed_tools = []
     agent._turn_file_mutation_paths = set()
     agent._verification_stop_nudges = 0
 

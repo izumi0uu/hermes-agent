@@ -184,6 +184,18 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
     assert "different tool" in content
 
 
+def test_terminal_failure_appends_external_state_verification_notice():
+    agent = _make_agent("terminal")
+    tc = _mock_tool_call("terminal", json.dumps({"command": "git push origin main"}), "c-push")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value=json.dumps({"exit_code": 1, "error": "push failed"})):
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    assert "External-state verification" in messages[0]["content"]
+
+
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
     agent = _make_agent("web_search", config=_hard_stop_config())
     blocked_args = {"query": "blocked"}
@@ -266,6 +278,39 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert result["final_response"] == "done"
     tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
+
+
+def test_run_conversation_appends_failed_tool_footer_after_terminal_push_error():
+    agent = _make_agent("terminal", max_iterations=10)
+    push_args = {"command": "git push origin main"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", json.dumps(push_args), "c-push")],
+        ),
+        _mock_response(content="done", finish_reason="stop", tool_calls=None),
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"exit_code": 1, "error": "push failed"}),
+        ) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("publish the repo")
+
+    assert mock_hfc.call_count == 1
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"].startswith("done")
+    assert "Tool-failure verifier" in result["final_response"]
+    assert "`terminal`" in result["final_response"]
+    assert "push failed" in result["final_response"]
+    assert "`git push origin main`" in result["final_response"]
 
 
 def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():

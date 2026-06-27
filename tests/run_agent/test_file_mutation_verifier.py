@@ -129,6 +129,7 @@ def _bare_agent() -> AIAgent:
     """
     agent = object.__new__(AIAgent)
     agent._turn_failed_file_mutations = {}
+    agent._turn_failed_tools = []
     agent._turn_file_mutation_paths = set()
     return agent
 
@@ -271,6 +272,52 @@ class TestRecordFileMutationResult:
         )
         assert set(agent._turn_failed_file_mutations) == {"/tmp/a.md", "/tmp/b.md"}
 
+
+class TestRecordFailedToolResult:
+    def test_non_error_ignored(self):
+        agent = _bare_agent()
+        agent._record_failed_tool_result(
+            "web_search", {"q": "hi"}, json.dumps({"success": True}), is_error=False
+        )
+        assert agent._turn_failed_tools == []
+
+    def test_file_mutation_tools_deferred_to_dedicated_footer(self):
+        agent = _bare_agent()
+        agent._record_failed_tool_result(
+            "patch", {"path": "/tmp/a.py"}, json.dumps({"error": "boom"}), is_error=True
+        )
+        assert agent._turn_failed_tools == []
+
+    def test_error_is_recorded(self):
+        agent = _bare_agent()
+        agent._record_failed_tool_result(
+            "terminal",
+            {"command": "git push origin main"},
+            json.dumps({"error": "push failed"}),
+            is_error=True,
+        )
+        assert agent._turn_failed_tools == [
+            {
+                "tool": "terminal",
+                "blocked": False,
+                "error_preview": "push failed",
+                "command_preview": "git push origin main",
+            }
+        ]
+
+    def test_blocked_terminal_records_command_preview(self):
+        agent = _bare_agent()
+        agent._record_failed_tool_result(
+            "terminal",
+            {"command": "git push origin main"},
+            json.dumps({"error": "Blocked by policy"}),
+            is_error=True,
+            blocked=True,
+        )
+        assert agent._turn_failed_tools[0]["tool"] == "terminal"
+        assert agent._turn_failed_tools[0]["blocked"] is True
+        assert agent._turn_failed_tools[0]["command_preview"] == "git push origin main"
+
     def test_no_state_dict_silent_noop(self):
         """When called outside run_conversation the state dict is absent.
 
@@ -377,6 +424,26 @@ class TestFormatFooter:
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_failed_tool_footer_empty_returns_empty_string(self):
+        assert AIAgent._format_failed_tool_footer([]) == ""
+
+    def test_failed_tool_footer_mentions_unverified_external_state(self):
+        out = AIAgent._format_failed_tool_footer(
+            [
+                {
+                    "tool": "terminal",
+                    "blocked": True,
+                    "error_preview": "Blocked by policy",
+                    "command_preview": "git push origin main",
+                }
+            ]
+        )
+        assert "Tool-failure verifier" in out
+        assert "unverified" in out
+        assert "`terminal`" in out
+        assert "Blocked by policy" in out
+        assert "`git push origin main`" in out
 
 
 # ---------------------------------------------------------------------------
