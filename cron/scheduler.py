@@ -350,6 +350,59 @@ def _shutdown_parallel_pool() -> None:
 atexit.register(_shutdown_parallel_pool)
 
 
+def _submit_job_with_running_guard(
+    job: dict,
+    pool: concurrent.futures.ThreadPoolExecutor,
+    runner,
+) -> Optional[concurrent.futures.Future]:
+    """Submit one cron job to *pool* unless the same job is already running.
+
+    Returns the future, or ``None`` when the running-set guard rejected a
+    duplicate dispatch. The running-set membership is always released by the
+    worker's ``finally`` block, even if execution raises.
+    """
+    job_id = job["id"]
+    with _running_lock:
+        if job_id in _running_job_ids:
+            logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+            return None
+        _running_job_ids.add(job_id)
+    _ctx = contextvars.copy_context()
+
+    def _run_and_release(j=job, ctx=_ctx):
+        try:
+            return ctx.run(runner, j)
+        finally:
+            with _running_lock:
+                _running_job_ids.discard(j["id"])
+
+    return pool.submit(_run_and_release)
+
+
+def dispatch_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    max_workers: Optional[int] = None,
+) -> Optional[concurrent.futures.Future]:
+    """Dispatch one cron job to the appropriate persistent pool.
+
+    This is the single-job counterpart to ``tick(sync=False)``: it preserves
+    the same in-flight dedupe guard and the same workdir-aware pool selection,
+    but it only queues one already-authorized job and returns immediately.
+    Returns the queued future, or ``None`` when a prior run of the same job is
+    still in flight.
+    """
+
+    def _process_job(one_job: dict) -> bool:
+        return run_one_job(one_job, adapters=adapters, loop=loop, verbose=verbose)
+
+    pool = _get_sequential_pool() if (job.get("workdir") or "").strip() else _get_parallel_pool(max_workers)
+    return _submit_job_with_running_guard(job, pool, _process_job)
+
+
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
 
@@ -2904,13 +2957,6 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 _max_workers if _max_workers else "unbounded",
             )
 
-        def _process_job(job: dict) -> bool:
-            """Run one due job end-to-end. Thin wrapper around the shared
-            module-level ``run_one_job`` so ``tick`` and external providers
-            (Chronos ``fire_due``) use the identical execute→save→deliver→mark
-            body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
-
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
         # so they MUST run sequentially to avoid corrupting each other.  Jobs
@@ -2921,30 +2967,6 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         _results: list = []
         _all_futures: list = []
 
-        def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor):
-            """Submit a job fire-and-forget with the in-flight dedup guard.
-
-            Returns the future, or None if the job was skipped because a prior
-            tick's run of the same job is still in flight.  The running-set
-            membership is released in the worker's finally block.
-            """
-            job_id = job["id"]
-            with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
-            _ctx = contextvars.copy_context()
-
-            def _run_and_release(j=job, ctx=_ctx):
-                try:
-                    return ctx.run(_process_job, j)
-                finally:
-                    with _running_lock:
-                        _running_job_ids.discard(j["id"])
-
-            return pool.submit(_run_and_release)
-
         # Sequential pass for env-mutating (workdir) jobs.
         # Queued to a persistent single-thread pool so they run one at a time
         # WITHOUT blocking the ticker thread — a long workdir job no
@@ -2952,9 +2974,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # pass, just serialized).  The in-flight guard prevents a still-running
         # job from being re-queued on the next tick.
         if sequential_jobs:
-            seq_pool = _get_sequential_pool()
             for job in sequential_jobs:
-                fut = _submit_with_guard(job, seq_pool)
+                fut = dispatch_job(job, adapters=adapters, loop=loop, verbose=verbose)
                 if fut is None:
                     continue
                 _all_futures.append(fut)
@@ -2967,9 +2988,14 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # after completion finds the job due again naturally.  No catch-up
         # queue needed.
         if parallel_jobs:
-            pool = _get_parallel_pool(_max_workers)
             for job in parallel_jobs:
-                fut = _submit_with_guard(job, pool)
+                fut = dispatch_job(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    max_workers=_max_workers,
+                )
                 if fut is None:
                     continue
                 _all_futures.append(fut)
