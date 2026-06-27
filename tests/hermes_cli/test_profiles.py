@@ -19,6 +19,7 @@ from hermes_cli.profiles import (
     validate_profile_name,
     get_profile_dir,
     create_profile,
+    _count_skills,
     delete_profile,
     list_profiles,
     set_active_profile,
@@ -616,6 +617,39 @@ class TestListProfiles:
         profiles = list_profiles()
         assert profiles[0].name == "default"
         assert profiles[0].is_default is True
+
+
+class TestCountSkills:
+    """Tests for _count_skills()."""
+
+    def test_prunes_excluded_and_support_dirs_without_rglob(self, profile_env, monkeypatch):
+        default_home = profile_env / ".hermes"
+        skills_dir = default_home / "skills"
+        real_skill = skills_dir / "real"
+        (real_skill / "SKILL.md").parent.mkdir(parents=True)
+        (real_skill / "SKILL.md").write_text("---\nname: real\n---\n", encoding="utf-8")
+        (skills_dir / ".venv" / "archived" / "SKILL.md").parent.mkdir(parents=True)
+        (skills_dir / ".venv" / "archived" / "SKILL.md").write_text(
+            "---\nname: archived\n---\n",
+            encoding="utf-8",
+        )
+        (skills_dir / "node_modules" / "vendor" / "SKILL.md").parent.mkdir(parents=True)
+        (skills_dir / "node_modules" / "vendor" / "SKILL.md").write_text(
+            "---\nname: vendor\n---\n",
+            encoding="utf-8",
+        )
+        (real_skill / "references" / "legacy" / "SKILL.md").parent.mkdir(parents=True)
+        (real_skill / "references" / "legacy" / "SKILL.md").write_text(
+            "---\nname: legacy\n---\n",
+            encoding="utf-8",
+        )
+
+        def _fail_rglob(self, pattern):
+            raise AssertionError(f"Path.rglob should not be used for {pattern}")
+
+        monkeypatch.setattr(Path, "rglob", _fail_rglob)
+
+        assert _count_skills(default_home) == 1
 
 
 # ===================================================================
