@@ -418,6 +418,8 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
     // multi-line prompts (term.clear() would drop all but the cursor row) and we
     // stop the moment real output exists, so command scrollback is never wiped.
     let promptPristine = true
+    let promptPainted = false
+    let gapCleanupSent = false
     let gapCleanupTimer = 0
 
     // While armed, strip leading blank rows so the prompt lands at the very top
@@ -447,12 +449,17 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
         return
       }
 
+      promptPainted = true
       stripLeading = false
       term.write(next)
     }
 
     const scheduleGapCleanup = () => {
-      if (!promptPristine) {
+      // The first visible prompt already has its leading blank rows stripped in
+      // armedWrite(). Only ask the shell for one pristine redraw after that, so
+      // a pane whose geometry settles in several steps doesn't blink repeatedly
+      // on launch or session switch.
+      if (!promptPristine || !promptPainted || gapCleanupSent) {
         return
       }
 
@@ -464,10 +471,11 @@ export function useTerminalSession({ cwd, onAddSelectionToChat }: UseTerminalSes
         gapCleanupTimer = 0
         const id = sessionIdRef.current
 
-        if (disposed || !id || !promptPristine) {
+        if (disposed || !id || !promptPristine || !promptPainted || gapCleanupSent) {
           return
         }
 
+        gapCleanupSent = true
         stripLeading = true
         void terminalApi.write(id, '\f')
         term.clearSelection()
