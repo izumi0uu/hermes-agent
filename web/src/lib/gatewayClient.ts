@@ -14,6 +14,7 @@
  */
 
 import { HERMES_BASE_PATH, getWsTicket } from "@/lib/api";
+import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
 
 export type GatewayEventName =
   | "gateway.ready"
@@ -150,7 +151,10 @@ export class GatewayClient {
       }
     });
 
-    ws.addEventListener("close", () => {
+    ws.addEventListener("close", (ev) => {
+      if (maybeReloadForLoopbackWsAuthFailure(ev.code)) {
+        return;
+      }
       this.setState("closed");
       this.rejectAllPending(new Error("WebSocket closed"));
     });
