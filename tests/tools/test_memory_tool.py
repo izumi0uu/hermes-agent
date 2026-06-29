@@ -393,6 +393,27 @@ class TestMemoryStorePersistence:
         store.load_from_disk()
         assert len(store.memory_entries) == 2
 
+    def test_writes_stay_on_store_bound_memory_dir_after_hermes_home_switch(
+        self, tmp_path, monkeypatch
+    ):
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+        (profile_a / "memories").mkdir(parents=True)
+        (profile_b / "memories").mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_a))
+        store = MemoryStore()
+        store.load_from_disk()
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_b))
+        result = store.add("memory", "profile-scoped memory write")
+
+        assert result["success"] is True
+        assert (profile_a / "memories" / "MEMORY.md").read_text() == (
+            "profile-scoped memory write"
+        )
+        assert not (profile_b / "memories" / "MEMORY.md").exists()
+
 
 class TestMemoryStoreSnapshot:
     def test_snapshot_frozen_at_load(self, store):
