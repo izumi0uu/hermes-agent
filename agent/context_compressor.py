@@ -919,6 +919,42 @@ class ContextCompressor(ContextEngine):
                 self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
 
+    def snapshot_preflight_state(self) -> Dict[str, Any]:
+        """Capture preflight-only state that must not leak across interrupts.
+
+        A turn can mutate display / anti-thrashing state before the first real
+        provider response arrives: preflight may seed ``last_prompt_tokens``
+        from a rough estimate and compaction can bump the ineffective counter.
+        If the user interrupts before any response usage is reported, that
+        speculative state must not poison the next turn.
+        """
+        return {
+            "last_prompt_tokens": self.last_prompt_tokens,
+            "ineffective_compression_count": self._ineffective_compression_count,
+            "last_compression_savings_pct": self._last_compression_savings_pct,
+            "compression_count": self.compression_count,
+        }
+
+    def rollback_interrupted_preflight_state(self, snapshot: Dict[str, Any]) -> None:
+        """Restore speculative preflight state after an interrupted turn.
+
+        Keep the post-compression ``-1`` sentinel when this interrupted turn
+        really *did* compact the transcript — the next turn is still awaiting
+        the first provider-reported usage for that shorter conversation. But
+        always roll back the anti-thrashing counters, because an interrupted
+        turn must not consume the user's future compression budget.
+        """
+        self._ineffective_compression_count = snapshot["ineffective_compression_count"]
+        self._last_compression_savings_pct = snapshot["last_compression_savings_pct"]
+
+        _completed_preflight_compression = (
+            self.awaiting_real_usage_after_compression
+            and self.last_prompt_tokens == -1
+            and self.compression_count > snapshot["compression_count"]
+        )
+        if not _completed_preflight_compression:
+            self.last_prompt_tokens = snapshot["last_prompt_tokens"]
+
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
 

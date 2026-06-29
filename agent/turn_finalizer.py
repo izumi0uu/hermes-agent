@@ -132,6 +132,23 @@ def finalize_turn(
         )
     )
 
+    # Preflight can mutate display / anti-thrashing state before the first
+    # provider response arrives. If the turn ends interrupted before any usage
+    # data was reported, roll that speculative state back so the next turn
+    # isn't polluted by work the model never got to consume. A completed
+    # preflight compaction keeps its post-compression sentinel because the
+    # transcript really is shorter now; only the speculative counters revert.
+    _preflight_snapshot = getattr(agent, "_turn_preflight_state_snapshot", None)
+    if (
+        interrupted
+        and _preflight_snapshot
+        and not getattr(agent, "_turn_received_provider_usage", False)
+        and getattr(agent, "context_compressor", None) is not None
+    ):
+        agent.context_compressor.rollback_interrupted_preflight_state(
+            _preflight_snapshot
+        )
+
     # Post-loop cleanup must never lose the response.  Trajectory save,
     # resource teardown, and session persistence all touch fallible
     # surfaces — file I/O / JSON serialization (_save_trajectory), remote
@@ -484,5 +501,8 @@ def finalize_turn(
         )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
+
+    agent._turn_preflight_state_snapshot = None
+    agent._turn_received_provider_usage = False
 
     return result

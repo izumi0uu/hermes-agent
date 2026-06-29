@@ -335,6 +335,8 @@ def build_turn_context(
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
     # issue #27405 (a few very large messages slipping past the count gate).
+    agent._turn_received_provider_usage = False
+    agent._turn_preflight_state_snapshot = None
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
         agent.context_compressor.protect_first_n,
@@ -347,6 +349,7 @@ def build_turn_context(
             tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
+        agent._turn_preflight_state_snapshot = _compressor.snapshot_preflight_state()
         _defer_preflight = getattr(
             _compressor,
             "should_defer_preflight_to_real_usage",

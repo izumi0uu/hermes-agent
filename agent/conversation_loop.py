@@ -1927,6 +1927,7 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    agent._turn_received_provider_usage = True
                     agent.context_compressor.update_from_response(usage_dict)
 
                     # Cache discovered context length after successful call.
