@@ -2698,6 +2698,60 @@ class TestRunJobWakeGate:
         script_fn.assert_not_called()
         agent_cls.assert_called_once()
 
+    def test_closes_agent_before_session_db(self):
+        """Cron cleanup must leave draining agent work a live SessionDB.
+
+        Background-review forks can keep flushing messages after the main
+        turn returns. If the cron teardown closes the SessionDB before
+        ``agent.close()``, those flushes see a nulled connection and log
+        ``Session DB append_message failed`` warnings.
+        """
+        import cron.scheduler as scheduler
+
+        events = []
+        end_reasons = []
+
+        class FakeSessionDB:
+            def set_session_title(self, *_args, **_kwargs):
+                events.append("set_session_title")
+
+            def end_session(self, _session_id, reason):
+                events.append("end_session")
+                end_reasons.append(reason)
+
+            def close(self):
+                events.append("session_db.close")
+
+        class FakeAgent:
+            def __init__(self, **_kwargs):
+                self._session_messages = []
+
+            def run_conversation(self, _prompt):
+                return {"final_response": "ok", "messages": []}
+
+            def close(self):
+                events.append("agent.close")
+                events.append("agent.end_session")
+
+        with patch.object(scheduler, "_run_job_script", return_value=(True, "wakeAgent=true")), \
+             patch("run_agent.AIAgent", return_value=FakeAgent()) as agent_cls, \
+             patch("hermes_state.SessionDB", return_value=FakeSessionDB()) as db_cls:
+            success, _output, final_response, error = scheduler.run_job(self._make_job())
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        agent_cls.assert_called_once()
+        db_cls.assert_called_once()
+        assert events == [
+            "set_session_title",
+            "end_session",
+            "agent.close",
+            "agent.end_session",
+            "session_db.close",
+        ]
+        assert end_reasons == ["cron_complete"]
+
 
 class TestBuildJobPromptMissingSkill:
     """Verify that a missing skill logs a warning and does not crash the job."""

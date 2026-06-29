@@ -2728,10 +2728,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _session_db.end_session(_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
-            try:
-                _session_db.close()
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+        # Keep the SQLite connection alive until the agent has finished its
+        # own teardown so any draining child work can still flush messages.
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -2741,6 +2739,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 agent.close()
         except (Exception, KeyboardInterrupt) as e:
             logger.debug("Job '%s': failed to close agent resources: %s", job_id, e)
+        if _session_db:
+            try:
+                _session_db.close()
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
         # Each cron run spins up a short-lived worker thread whose event loop
         # dies as soon as the ``ThreadPoolExecutor`` shuts down. Any async
         # httpx clients cached under that loop are now unusable — reap them
