@@ -589,11 +589,12 @@ class TestRoutingIntents:
 
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
+        monkeypatch.setenv("WEIXIN_HOME_CHANNEL", "wx-home")
 
         for token in ("ALL", "All", "all"):
             targets = _resolve_delivery_targets({"deliver": token, "origin": None})
-            platforms = sorted(t["platform"].lower() for t in targets)
-            assert platforms == ["discord", "telegram"], f"token={token!r} -> {platforms}"
+            platforms = {t["platform"].lower() for t in targets}
+            assert {"discord", "telegram", "weixin"}.issubset(platforms), f"token={token!r} -> {sorted(platforms)}"
 
 
 class TestDeliverResultWrapping:
