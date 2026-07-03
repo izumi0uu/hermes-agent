@@ -864,6 +864,8 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        "retry_on_model_failure_same_day": False,
+        "retry_on_model_failure_interval_minutes": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery

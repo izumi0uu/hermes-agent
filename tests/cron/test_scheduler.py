@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _compute_same_day_retry_next_run
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -74,6 +74,50 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestSameDayRetryNextRun:
+    def test_returns_one_hour_later_within_same_day_window(self):
+        job = {
+            "retry_on_model_failure_same_day": True,
+            "retry_on_model_failure_interval_minutes": 60,
+        }
+        now_iso = "2026-06-29T08:30:43+08:00"
+
+        got = _compute_same_day_retry_next_run(job, now_iso)
+
+        assert got == "2026-06-29T09:30:43+08:00"
+
+    def test_returns_none_when_candidate_crosses_into_next_day(self):
+        job = {
+            "retry_on_model_failure_same_day": True,
+            "retry_on_model_failure_interval_minutes": 60,
+        }
+        now_iso = "2026-06-29T23:30:43+08:00"
+
+        got = _compute_same_day_retry_next_run(job, now_iso)
+
+        assert got is None
+
+    def test_disabled_flag_returns_none(self):
+        job = {
+            "retry_on_model_failure_same_day": False,
+            "retry_on_model_failure_interval_minutes": 60,
+        }
+
+        got = _compute_same_day_retry_next_run(job, "2026-06-29T08:30:43+08:00")
+
+        assert got is None
+
+    def test_invalid_interval_falls_back_to_one_hour(self):
+        job = {
+            "retry_on_model_failure_same_day": True,
+            "retry_on_model_failure_interval_minutes": 0,
+        }
+
+        got = _compute_same_day_retry_next_run(job, "2026-06-29T08:30:43+08:00")
+
+        assert got == "2026-06-29T09:30:43+08:00"
 
 
 class TestResolveOrigin:
@@ -1475,6 +1519,75 @@ class TestRunJobSessionPersistence:
         assert call_args[0][0] == "empty-job"
         assert call_args[0][1] is False  # success should be False
         assert "empty" in call_args[0][2].lower()  # error should mention empty
+
+    def test_tick_reschedules_same_day_retry_after_model_failure(self, tmp_path):
+        from cron.scheduler import tick
+
+        job = {
+            "id": "retry-job",
+            "name": "retry-test",
+            "prompt": "do something",
+            "schedule": "every 1d",
+            "enabled": True,
+            "next_run_at": "2026-06-29T08:30:00+08:00",
+            "deliver": "local",
+            "last_status": None,
+            "retry_on_model_failure_same_day": True,
+            "retry_on_model_failure_interval_minutes": 60,
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.mark_job_run") as mock_mark, \
+             patch("cron.scheduler.update_job") as mock_update, \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler._hermes_now") as mock_now, \
+             patch("cron.scheduler.run_job", return_value=(False, "output", "", "RuntimeError: HTTP 502: Upstream access forbidden")):
+            mock_now.return_value.isoformat.return_value = "2026-06-29T08:30:43+08:00"
+            mock_now.return_value.strftime.return_value = "08:30:43"
+            tick(verbose=False)
+
+        mock_mark.assert_called_once_with(
+            "retry-job",
+            False,
+            "RuntimeError: HTTP 502: Upstream access forbidden",
+            delivery_error=None,
+        )
+        mock_update.assert_called_once_with(
+            "retry-job",
+            {"next_run_at": "2026-06-29T09:30:43+08:00", "state": "scheduled", "enabled": True},
+        )
+
+    def test_tick_does_not_reschedule_same_day_retry_after_success(self, tmp_path):
+        from cron.scheduler import tick
+
+        job = {
+            "id": "retry-job",
+            "name": "retry-test",
+            "prompt": "do something",
+            "schedule": "every 1d",
+            "enabled": True,
+            "next_run_at": "2026-06-29T08:30:00+08:00",
+            "deliver": "local",
+            "last_status": None,
+            "retry_on_model_failure_same_day": True,
+            "retry_on_model_failure_interval_minutes": 60,
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.mark_job_run") as mock_mark, \
+             patch("cron.scheduler.update_job") as mock_update, \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler.run_job", return_value=(True, "output", "ok", None)):
+            tick(verbose=False)
+
+        mock_mark.assert_called_once()
+        mock_update.assert_not_called()
 
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
