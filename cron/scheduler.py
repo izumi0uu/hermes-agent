@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -238,6 +239,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import update_job
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -272,21 +274,40 @@ def _is_cron_silence_response(text: str) -> bool:
     def _is_token(line: str) -> bool:
         return " ".join(line.strip().upper().split()) in _CRON_SILENCE_TOKENS
 
-    # Whole response is exactly a token.
     if _is_token(stripped):
         return True
-    # Marker on its own first or last line (trailing/leading note on a
-    # separate line — e.g. "2 deals filtered\n\n[SILENT]").
     lines = [ln for ln in stripped.splitlines() if ln.strip()]
     if lines and (_is_token(lines[0]) or _is_token(lines[-1])):
         return True
-    # Bracketed sentinel used as a same-line prefix — the documented cron
-    # pattern "[SILENT] No changes detected".  Restricted to the bracketed
-    # form so a bare word like "Silent retry succeeded" is NOT swallowed.
     upper = stripped.upper()
     if upper.startswith("[SILENT]"):
         return True
     return False
+
+
+def _compute_same_day_retry_next_run(job: dict, now_iso: str) -> str | None:
+    """Return a same-day retry time for model failures, or None.
+
+    When enabled per job, a failed agent run is re-armed for ``interval``
+    minutes later, but only if that retry time still lands on the same local
+    calendar day as ``now_iso``. This keeps the normal schedule as the source
+    of truth for the next day while allowing bounded catch-up retries today.
+    """
+    if not job.get("retry_on_model_failure_same_day"):
+        return None
+
+    try:
+        interval_minutes = int(job.get("retry_on_model_failure_interval_minutes") or 60)
+    except (TypeError, ValueError):
+        interval_minutes = 60
+    if interval_minutes <= 0:
+        interval_minutes = 60
+
+    now_dt = datetime.fromisoformat(now_iso)
+    candidate = now_dt + timedelta(minutes=interval_minutes)
+    if candidate.date() != now_dt.date():
+        return None
+    return candidate.isoformat()
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -3154,6 +3175,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        if not success:
+            retry_next_run = _compute_same_day_retry_next_run(job, _hermes_now().isoformat())
+            if retry_next_run:
+                update_job(
+                    job["id"],
+                    {
+                        "next_run_at": retry_next_run,
+                        "state": "scheduled",
+                        "enabled": True,
+                    },
+                )
         return True
 
     except Exception as e:
