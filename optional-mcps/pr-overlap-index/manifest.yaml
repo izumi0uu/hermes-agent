@@ -1,0 +1,22 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: pr-overlap-index
+description: Index local pull request overlap data for repository review workflows.
+source: https://github.com/NousResearch/hermes-agent/tree/main/optional-mcps/pr-overlap-index
+
+transport:
+  type: stdio
+  command: "python3"
+  args:
+    - "${MANIFEST_DIR}/server.py"
+  env:
+    PR_OVERLAP_INDEX_ROOT: "${MANIFEST_DIR}"
+
+auth:
+  type: none
+
+post_install: |
+  This bundled MCP runs directly from the Hermes optional-mcps catalog checkout.
+  Start a new Hermes session to load its tools.

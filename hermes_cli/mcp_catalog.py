@@ -44,8 +44,10 @@ from hermes_cli.cli_output import prompt as _prompt_input
 
 _MANIFEST_VERSION = 1
 
-# Substituted at install time inside `transport.command` / `transport.args`.
+# Substituted at install time inside `transport.command` / `transport.args` /
+# `transport.env`.
 _INSTALL_DIR_VAR = "${INSTALL_DIR}"
+_MANIFEST_DIR_VAR = "${MANIFEST_DIR}"
 
 
 # ─── Data classes ────────────────────────────────────────────────────────────
@@ -75,6 +77,7 @@ class TransportSpec:
     type: str  # "stdio" | "http"
     command: Optional[str] = None
     args: List[str] = field(default_factory=list)
+    env: Dict[str, str] = field(default_factory=dict)
     url: Optional[str] = None
     version: Optional[str] = None  # informational, pinned
 
@@ -85,6 +88,7 @@ class InstallSpec:
 
     Omit for one-shot launchable servers (npx, uvx).
     """
+
     type: str  # "git"
     url: str
     ref: str  # commit/tag/branch — pinned, never floats
@@ -184,10 +188,14 @@ def _parse_manifest(path: Path) -> CatalogEntry:
     args = transport_raw.get("args") or []
     if not isinstance(args, list):
         raise CatalogError(f"{path}: transport.args must be a list")
+    transport_env = transport_raw.get("env") or {}
+    if not isinstance(transport_env, dict):
+        raise CatalogError(f"{path}: transport.env must be a mapping")
     transport = TransportSpec(
         type=t_type,
         command=transport_raw.get("command"),
         args=[str(a) for a in args],
+        env={str(k): str(v) for k, v in transport_env.items()},
         url=transport_raw.get("url"),
         version=transport_raw.get("version"),
     )
@@ -314,7 +322,7 @@ def catalog_diagnostics() -> List[tuple]:
 def get_entry(name: str) -> Optional[CatalogEntry]:
     """Look up a single entry by name. ``official/<name>`` prefix accepted."""
     if name.startswith("official/"):
-        name = name[len("official/"):]
+        name = name[len("official/") :]
     for entry in list_catalog():
         if entry.name == name:
             return entry
@@ -366,9 +374,7 @@ def _run_bootstrap(cwd: Path, commands: List[str]) -> None:
         print(color(f"  $ {cmd}", Colors.DIM))
         proc = subprocess.run(cmd, cwd=str(cwd), shell=True)
         if proc.returncode != 0:
-            raise CatalogError(
-                f"bootstrap step failed (exit {proc.returncode}): {cmd}"
-            )
+            raise CatalogError(f"bootstrap step failed (exit {proc.returncode}): {cmd}")
 
 
 def _do_git_install(entry: CatalogEntry) -> Path:
@@ -380,7 +386,9 @@ def _do_git_install(entry: CatalogEntry) -> Path:
 
     git = shutil.which("git")
     if not git:
-        raise CatalogError("git is required to install this MCP but was not found on PATH")
+        raise CatalogError(
+            "git is required to install this MCP but was not found on PATH"
+        )
 
     if dest.exists():
         # Fresh checkout each install — manifest version is the source of truth,
@@ -398,11 +406,18 @@ def _do_git_install(entry: CatalogEntry) -> Path:
 
     if not is_sha_ref:
         proc = subprocess.run(
-            [git, "clone", "--depth", "1", "--branch", install.ref, install.url, str(dest)],
+            [
+                git,
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                install.ref,
+                install.url,
+                str(dest),
+            ],
         )
-        if proc.returncode == 0:
-            pass
-        else:
+        if proc.returncode != 0:
             # Branch/tag form failed (unlikely for valid manifests; possible if
             # the ref was deleted upstream). Fall through to the full-clone path.
             if dest.exists():
@@ -423,14 +438,20 @@ def _do_git_install(entry: CatalogEntry) -> Path:
     return dest
 
 
-def _expand_install_dir(value: str, install_dir: Optional[Path]) -> str:
-    if _INSTALL_DIR_VAR not in value:
-        return value
-    if install_dir is None:
+def _expand_transport_value(
+    value: str,
+    *,
+    manifest_dir: Path,
+    install_dir: Optional[Path],
+) -> str:
+    if _INSTALL_DIR_VAR in value and install_dir is None:
         raise CatalogError(
             f"manifest references {_INSTALL_DIR_VAR} but no install block exists"
         )
-    return value.replace(_INSTALL_DIR_VAR, str(install_dir))
+    expanded = value.replace(_MANIFEST_DIR_VAR, str(manifest_dir))
+    if install_dir is not None:
+        expanded = expanded.replace(_INSTALL_DIR_VAR, str(install_dir))
+    return expanded
 
 
 def _prompt_env_vars(specs: List[EnvVarSpec]) -> Dict[str, str]:
@@ -457,17 +478,26 @@ def _prompt_env_vars(specs: List[EnvVarSpec]) -> Dict[str, str]:
     return collected
 
 
-def _build_server_config(
-    entry: CatalogEntry, install_dir: Optional[Path]
-) -> dict:
+def _build_server_config(entry: CatalogEntry, install_dir: Optional[Path]) -> dict:
     """Translate a manifest into the ``mcp_servers.<name>`` block format used
     by hermes_cli/mcp_config.py."""
     cfg: dict = {}
     t = entry.transport
+    manifest_dir = entry.manifest_path.parent
+
+    def expand(value: str) -> str:
+        return _expand_transport_value(
+            value,
+            manifest_dir=manifest_dir,
+            install_dir=install_dir,
+        )
+
     if t.type == "stdio":
-        cfg["command"] = _expand_install_dir(t.command or "", install_dir)
+        cfg["command"] = expand(t.command or "")
         if t.args:
-            cfg["args"] = [_expand_install_dir(a, install_dir) for a in t.args]
+            cfg["args"] = [expand(a) for a in t.args]
+        if t.env:
+            cfg["env"] = {k: expand(v) for k, v in t.env.items()}
     elif t.type == "http":
         cfg["url"] = t.url
         if entry.auth.type == "oauth":
@@ -565,22 +595,26 @@ def _apply_tool_selection(
         manifest_default = entry.tools.default_enabled
         if manifest_default:
             _write_tools_include(entry.name, manifest_default)
-            print(color(
-                f"  Couldn\'t probe server. Applied manifest default "
-                f"({len(manifest_default)} tools). "
-                f"Run `hermes mcp configure {entry.name}` after the server "
-                "is reachable to refine.",
-                Colors.YELLOW,
-            ))
+            print(
+                color(
+                    f"  Couldn't probe server. Applied manifest default "
+                    f"({len(manifest_default)} tools). "
+                    f"Run `hermes mcp configure {entry.name}` after the server "
+                    "is reachable to refine.",
+                    Colors.YELLOW,
+                )
+            )
         else:
             _write_tools_include(entry.name, None)
-            print(color(
-                f"  Couldn\'t probe server; installed with no tool filter "
-                "(all tools enabled when reachable). "
-                f"Run `hermes mcp configure {entry.name}` after first "
-                "connect to prune.",
-                Colors.YELLOW,
-            ))
+            print(
+                color(
+                    f"  Couldn't probe server; installed with no tool filter "
+                    "(all tools enabled when reachable). "
+                    f"Run `hermes mcp configure {entry.name}` after first "
+                    "connect to prune.",
+                    Colors.YELLOW,
+                )
+            )
         return
 
     if not probed:
@@ -604,6 +638,7 @@ def _apply_tool_selection(
     # Non-TTY: skip the checklist. Priority matches the interactive
     # pre-check priority: prior user selection > manifest default > all-on.
     import sys as _sys
+
     if not _sys.stdin.isatty():
         if prior_selection is not None:
             include = [n for n in prior_selection if n in tool_names]
@@ -615,18 +650,16 @@ def _apply_tool_selection(
             _write_tools_include(entry.name, None)
         return
 
-    print(color(
-        f"  Found {len(probed)} tool(s). "
-        f"Pre-checked: {len(pre_indices)}.",
-        Colors.GREEN,
-    ))
+    print(
+        color(
+            f"  Found {len(probed)} tool(s). Pre-checked: {len(pre_indices)}.",
+            Colors.GREEN,
+        )
+    )
 
     from hermes_cli.curses_ui import curses_checklist
 
-    labels = [
-        f"{n}  —  {(d[:60] + '...') if len(d) > 60 else d}"
-        for n, d in probed
-    ]
+    labels = [f"{n}  —  {(d[:60] + '...') if len(d) > 60 else d}" for n, d in probed]
     chosen_indices = curses_checklist(
         f"Select tools for '{entry.name}' (SPACE toggle, ENTER confirm)",
         labels,
@@ -637,11 +670,13 @@ def _apply_tool_selection(
         # User unchecked everything; treat as "no tools" — write empty include
         # so the server is installed but contributes nothing until reconfigured.
         _write_tools_include(entry.name, [])
-        print(color(
-            f"  No tools selected. Run `hermes mcp configure {entry.name}` "
-            "to change.",
-            Colors.YELLOW,
-        ))
+        print(
+            color(
+                f"  No tools selected. Run `hermes mcp configure {entry.name}` "
+                "to change.",
+                Colors.YELLOW,
+            )
+        )
         return
 
     if len(chosen_indices) == len(probed):
@@ -651,19 +686,23 @@ def _apply_tool_selection(
         # the user can re-run `hermes mcp configure <name>` and unselect a
         # tool to switch back to include-mode.
         _write_tools_include(entry.name, None)
-        print(color(
-            f"  ✓ All {len(probed)} tools enabled (no filter — new tools "
-            "the server adds later will be auto-enabled).",
-            Colors.GREEN,
-        ))
+        print(
+            color(
+                f"  ✓ All {len(probed)} tools enabled (no filter — new tools "
+                "the server adds later will be auto-enabled).",
+                Colors.GREEN,
+            )
+        )
         return
 
     chosen_names = [tool_names[i] for i in sorted(chosen_indices)]
     _write_tools_include(entry.name, chosen_names)
-    print(color(
-        f"  ✓ {len(chosen_names)}/{len(probed)} tools enabled.",
-        Colors.GREEN,
-    ))
+    print(
+        color(
+            f"  ✓ {len(chosen_names)}/{len(probed)} tools enabled.",
+            Colors.GREEN,
+        )
+    )
 
 
 def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
@@ -706,18 +745,22 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
             # the existing `hermes auth <provider>` flow. Surface guidance
             # here rather than auto-running it — keeps the catalog install
             # decoupled from provider-auth lifecycle.
-            print(color(
-                f"  This MCP uses {entry.auth.provider} OAuth. Run "
-                f"`hermes auth {entry.auth.provider}` if you have not "
-                "already authenticated.",
-                Colors.YELLOW,
-            ))
+            print(
+                color(
+                    f"  This MCP uses {entry.auth.provider} OAuth. Run "
+                    f"`hermes auth {entry.auth.provider}` if you have not "
+                    "already authenticated.",
+                    Colors.YELLOW,
+                )
+            )
         else:
-            print(color(
-                "  This MCP uses native OAuth 2.1; tokens will be acquired "
-                "on first connection (browser flow).",
-                Colors.DIM,
-            ))
+            print(
+                color(
+                    "  This MCP uses native OAuth 2.1; tokens will be acquired "
+                    "on first connection (browser flow).",
+                    Colors.DIM,
+                )
+            )
     # auth.type == "none": nothing to do.
 
     # ── Preserve any prior user tool selection across reinstalls ────────
@@ -741,12 +784,14 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
     _apply_tool_selection(entry, prior_selection=prior_selection)
 
     print()
-    print(color(
-        f"  ✓ Installed '{entry.name}' "
-        f"({'enabled' if enable else 'disabled'}). "
-        f"Start a new Hermes session to load its tools.",
-        Colors.GREEN,
-    ))
+    print(
+        color(
+            f"  ✓ Installed '{entry.name}' "
+            f"({'enabled' if enable else 'disabled'}). "
+            f"Start a new Hermes session to load its tools.",
+            Colors.GREEN,
+        )
+    )
     if entry.post_install:
         print()
         for line in entry.post_install.strip().splitlines():
