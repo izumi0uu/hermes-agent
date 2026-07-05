@@ -17,10 +17,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCORE_VERSION = "lexical-v1"
 MATCHER_VERSION = "compact-v1"
 NORMALIZATION_VERSION = "text-v1"
+DEFAULT_PATCH_SNIPPET_BYTES = 8192
 INDEX_VERSION = {
     "score": SCORE_VERSION,
     "matcher": MATCHER_VERSION,
@@ -28,13 +29,56 @@ INDEX_VERSION = {
 }
 
 
+class IndexNotInitializedError(RuntimeError):
+    """Raised when a read/query path is pointed at a missing index."""
+
+
+def _configure_connection(conn: sqlite3.Connection, *, write: bool = True) -> None:
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    if write:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            # Some test/in-memory connections cannot switch journal modes.
+            pass
+        conn.execute("PRAGMA synchronous=NORMAL")
+
+
 def _connect(db: str | Path | sqlite3.Connection) -> tuple[sqlite3.Connection, bool]:
     if isinstance(db, sqlite3.Connection):
-        db.row_factory = sqlite3.Row
+        _configure_connection(db)
         return db, False
     conn = sqlite3.connect(str(db))
-    conn.row_factory = sqlite3.Row
+    _configure_connection(conn)
     return conn, True
+
+
+def open_existing_index_db(
+    db: str | Path | sqlite3.Connection, *, validate_schema: bool = True
+) -> sqlite3.Connection:
+    """Open an existing index without creating files or running migrations."""
+    if isinstance(db, sqlite3.Connection):
+        _configure_connection(db, write=False)
+        conn = db
+    else:
+        path = Path(db)
+        if not path.exists():
+            raise IndexNotInitializedError(f"PR overlap index is not initialized: {path}")
+        conn = sqlite3.connect(f"file:{path}?mode=rw", uri=True)
+        _configure_connection(conn, write=False)
+    if validate_schema:
+        _validate_schema(conn)
+    return conn
+
+
+def _connect_existing(
+    db: str | Path | sqlite3.Connection, *, validate_schema: bool = True
+) -> tuple[sqlite3.Connection, bool]:
+    if isinstance(db, sqlite3.Connection):
+        return open_existing_index_db(db, validate_schema=validate_schema), False
+    return open_existing_index_db(db, validate_schema=validate_schema), True
 
 
 def _now() -> float:
@@ -56,6 +100,39 @@ def _scalar(conn: sqlite3.Connection, query: str, params: tuple[Any, ...] = ()) 
     if row is None:
         return None
     return row[0]
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+    )
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not _table_exists(conn, table):
+        return set()
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _validate_schema(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "meta"):
+        raise IndexNotInitializedError("PR overlap index schema is missing meta table")
+    schema_version = _scalar(conn, "SELECT value FROM meta WHERE key='schema_version'")
+    if schema_version is None:
+        raise IndexNotInitializedError("PR overlap index schema version is missing")
+    if int(schema_version) != SCHEMA_VERSION:
+        raise IndexNotInitializedError(
+            f"PR overlap index schema version {schema_version} != expected {SCHEMA_VERSION}"
+        )
+
+
+def _truncate_bytes(text: str, max_bytes: int = DEFAULT_PATCH_SNIPPET_BYTES) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", "ignore")
 
 
 def _terms(values: Iterable[Any]) -> set[str]:
@@ -123,6 +200,7 @@ def init_db(db: str | Path | sqlite3.Connection) -> None:
             );
             CREATE TABLE IF NOT EXISTS pr_revision_hunks(
               id INTEGER PRIMARY KEY, manifest_id INTEGER NOT NULL, path TEXT NOT NULL,
+              patch_hash TEXT DEFAULT '', hunk_hash TEXT DEFAULT '',
               patch_snippet TEXT DEFAULT '', diff_terms TEXT DEFAULT '', status TEXT DEFAULT 'modified',
               additions INTEGER DEFAULT 0, deletions INTEGER DEFAULT 0
             );
@@ -143,8 +221,28 @@ def init_db(db: str | Path | sqlite3.Connection) -> None:
               pr_number INTEGER NOT NULL, classification TEXT NOT NULL, capsule_hash TEXT NOT NULL,
               payload_json TEXT NOT NULL, emitted_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS indexer_locks(
+              name TEXT PRIMARY KEY, holder TEXT NOT NULL, acquired_at REAL NOT NULL,
+              heartbeat_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS indexer_watermarks(
+              repo TEXT NOT NULL, scope TEXT NOT NULL, watermark TEXT DEFAULT '',
+              updated_at REAL NOT NULL, PRIMARY KEY(repo, scope)
+            );
+            CREATE TABLE IF NOT EXISTS resource_samples(
+              id INTEGER PRIMARY KEY, sampled_at REAL NOT NULL, metric TEXT NOT NULL,
+              value REAL NOT NULL, detail TEXT DEFAULT ''
+            );
             """
         )
+        if "patch_hash" not in _columns(conn, "pr_revision_hunks"):
+            conn.execute(
+                "ALTER TABLE pr_revision_hunks ADD COLUMN patch_hash TEXT DEFAULT ''"
+            )
+        if "hunk_hash" not in _columns(conn, "pr_revision_hunks"):
+            conn.execute(
+                "ALTER TABLE pr_revision_hunks ADD COLUMN hunk_hash TEXT DEFAULT ''"
+            )
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
             (str(SCHEMA_VERSION),),
@@ -157,9 +255,18 @@ def init_db(db: str | Path | sqlite3.Connection) -> None:
 
 def health_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
     """Return a stdlib-only health snapshot for the optional overlap index."""
-    conn, close = _connect(db)
     try:
-        init_db(conn)
+        conn, close = _connect_existing(db, validate_schema=True)
+    except IndexNotInitializedError as exc:
+        return {
+            "ok": False,
+            "initialized": False,
+            "error": str(exc),
+            "schema_version": None,
+            "expected_schema_version": SCHEMA_VERSION,
+            "index_version": INDEX_VERSION,
+        }
+    try:
         now = _now()
         schema_version = _scalar(
             conn, "SELECT value FROM meta WHERE key='schema_version'"
@@ -170,6 +277,14 @@ def health_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
         latest_dlq = _scalar(
             conn, "SELECT MAX(last_failed_at) FROM refresh_dead_letters"
         )
+        capsule_count = int(_scalar(conn, "SELECT COUNT(*) FROM replay_capsules") or 0)
+        capsule_bytes = int(
+            _scalar(
+                conn,
+                "SELECT COALESCE(SUM(LENGTH(payload_json)),0) FROM replay_capsules",
+            )
+            or 0
+        )
         timestamps = [
             ts
             for ts in (latest_refresh, latest_source_update, latest_lease, latest_dlq)
@@ -177,6 +292,7 @@ def health_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
         ]
         return {
             "ok": True,
+            "initialized": True,
             "schema_version": int(schema_version or SCHEMA_VERSION),
             "index_version": INDEX_VERSION,
             "indexed_pr_count": int(_scalar(conn, "SELECT COUNT(*) FROM prs") or 0),
@@ -205,6 +321,21 @@ def health_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
             "dead_letter_count": int(
                 _scalar(conn, "SELECT COUNT(*) FROM refresh_dead_letters") or 0
             ),
+            "historical_anchor_count": int(
+                _scalar(
+                    conn,
+                    "SELECT COUNT(*) FROM pr_revision_manifests WHERE superseded_by_manifest_id IS NOT NULL OR tombstoned_at IS NOT NULL",
+                )
+                or 0
+            ),
+            "replay_capsule_count": capsule_count,
+            "replay_capsule_bytes": capsule_bytes,
+            "replay_capsule_oldest_at": _scalar(
+                conn, "SELECT MIN(emitted_at) FROM replay_capsules"
+            ),
+            "replay_capsule_newest_at": _scalar(
+                conn, "SELECT MAX(emitted_at) FROM replay_capsules"
+            ),
             "last_refreshed_at": latest_refresh,
             "last_source_updated_at": latest_source_update,
             "last_sync_at": max(timestamps) if timestamps else None,
@@ -214,8 +345,8 @@ def health_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
             conn.close()
 
 
-def upsert_pr_revision(
-    db: str | Path | sqlite3.Connection,
+def _upsert_pr_revision_conn(
+    conn: sqlite3.Connection,
     repo: str,
     pr_number: int,
     *,
@@ -230,102 +361,130 @@ def upsert_pr_revision(
     evidence_version: int = 1,
     tombstone_reason: str = "superseded",
 ) -> dict[str, Any]:
+    repo_id = _ensure_repo(conn, repo)
+    files = files or []
+    source_updated_at = source_updated_at or _now()
+    previous = conn.execute(
+        "SELECT latest_manifest_id FROM prs WHERE repo_id=? AND number=?",
+        (repo_id, pr_number),
+    ).fetchone()
+    parent_id = int(previous[0]) if previous and previous[0] is not None else None
+    canonical_files: list[dict[str, Any]] = []
+    for f in files:
+        path = str(f.get("path", ""))
+        raw_patch = str(f.get("patch_snippet", f.get("patch", "")))
+        patch = _truncate_bytes(raw_patch, int(f.get("snippet_max_bytes", DEFAULT_PATCH_SNIPPET_BYTES)))
+        patch_hash = hashlib.sha256(raw_patch.encode()).hexdigest()
+        diff_terms = " ".join(sorted(_terms([path, patch, f.get("diff_terms", "")])))
+        hunk_payload = {
+            "path": path,
+            "patch_hash": patch_hash,
+            "diff_terms": diff_terms,
+            "status": f.get("status", "modified"),
+            "additions": int(f.get("additions", 0)),
+            "deletions": int(f.get("deletions", 0)),
+        }
+        hunk_hash = hashlib.sha256(_json(hunk_payload).encode()).hexdigest()
+        canonical_files.append({
+            **hunk_payload,
+            "patch_snippet": patch,
+            "hunk_hash": hunk_hash,
+        })
+    payload = {
+        "repo": repo,
+        "pr": pr_number,
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+        "title": title,
+        "body": body,
+        "files": canonical_files,
+        "evidence_version": evidence_version,
+    }
+    mh = _manifest_hash(payload)
+    row = conn.execute(
+        "SELECT id FROM pr_revision_manifests WHERE manifest_hash=?", (mh,)
+    ).fetchone()
+    if row:
+        manifest_id = int(row[0])
+    else:
+        body_hash = hashlib.sha256(body.encode()).hexdigest()
+        cur = conn.execute(
+            """INSERT INTO pr_revision_manifests(repo_id,pr_number,head_sha,base_sha,captured_at,source_updated_at,evidence_version,body_hash,manifest_hash,parent_manifest_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                repo_id,
+                pr_number,
+                head_sha,
+                base_sha,
+                _now(),
+                source_updated_at,
+                evidence_version,
+                body_hash,
+                mh,
+                parent_id,
+            ),
+        )
+        manifest_id = int(cur.lastrowid)
+        for f in canonical_files:
+            conn.execute(
+                "INSERT INTO pr_revision_hunks(manifest_id,path,patch_hash,hunk_hash,patch_snippet,diff_terms,status,additions,deletions) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    manifest_id,
+                    f["path"],
+                    f["patch_hash"],
+                    f["hunk_hash"],
+                    f["patch_snippet"],
+                    f["diff_terms"],
+                    f["status"],
+                    f["additions"],
+                    f["deletions"],
+                ),
+            )
+    if parent_id and parent_id != manifest_id:
+        conn.execute(
+            "UPDATE pr_revision_manifests SET superseded_by_manifest_id=?, tombstoned_at=COALESCE(tombstoned_at,?), tombstone_reason=COALESCE(tombstone_reason,?) WHERE id=?",
+            (manifest_id, _now(), tombstone_reason, parent_id),
+        )
+    conn.execute(
+        """INSERT INTO prs(repo_id,number,state,title,body,url,head_sha,base_sha,source_updated_at,latest_manifest_id,evidence_version)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(repo_id,number) DO UPDATE SET state=excluded.state,title=excluded.title,body=excluded.body,url=excluded.url,head_sha=excluded.head_sha,base_sha=excluded.base_sha,source_updated_at=excluded.source_updated_at,latest_manifest_id=excluded.latest_manifest_id,evidence_version=excluded.evidence_version""",
+        (
+            repo_id,
+            pr_number,
+            state,
+            title,
+            body,
+            url,
+            head_sha,
+            base_sha,
+            source_updated_at,
+            manifest_id,
+            evidence_version,
+        ),
+    )
+    return {
+        "repo": repo,
+        "pr_number": pr_number,
+        "manifest_id": manifest_id,
+        "manifest_hash": mh,
+        "superseded_manifest_id": parent_id if parent_id != manifest_id else None,
+    }
+
+
+def upsert_pr_revision(
+    db: str | Path | sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    **kwargs: Any,
+) -> dict[str, Any]:
     """Append a revision manifest and make it the latest live PR revision."""
     conn, close = _connect(db)
     try:
         init_db(conn)
-        repo_id = _ensure_repo(conn, repo)
-        files = files or []
-        source_updated_at = source_updated_at or _now()
-        previous = conn.execute(
-            "SELECT latest_manifest_id FROM prs WHERE repo_id=? AND number=?",
-            (repo_id, pr_number),
-        ).fetchone()
-        parent_id = int(previous[0]) if previous and previous[0] is not None else None
-        payload = {
-            "repo": repo,
-            "pr": pr_number,
-            "head_sha": head_sha,
-            "base_sha": base_sha,
-            "title": title,
-            "body": body,
-            "files": files,
-            "evidence_version": evidence_version,
-        }
-        mh = _manifest_hash(payload)
-        row = conn.execute(
-            "SELECT id FROM pr_revision_manifests WHERE manifest_hash=?", (mh,)
-        ).fetchone()
-        if row:
-            manifest_id = int(row[0])
-        else:
-            body_hash = hashlib.sha256(body.encode()).hexdigest()
-            cur = conn.execute(
-                """INSERT INTO pr_revision_manifests(repo_id,pr_number,head_sha,base_sha,captured_at,source_updated_at,evidence_version,body_hash,manifest_hash,parent_manifest_id)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    repo_id,
-                    pr_number,
-                    head_sha,
-                    base_sha,
-                    _now(),
-                    source_updated_at,
-                    evidence_version,
-                    body_hash,
-                    mh,
-                    parent_id,
-                ),
-            )
-            manifest_id = int(cur.lastrowid)
-            for f in files:
-                path = str(f.get("path", ""))
-                patch = str(f.get("patch_snippet", f.get("patch", "")))
-                diff_terms = " ".join(
-                    sorted(_terms([path, patch, f.get("diff_terms", "")]))
-                )
-                conn.execute(
-                    "INSERT INTO pr_revision_hunks(manifest_id,path,patch_snippet,diff_terms,status,additions,deletions) VALUES(?,?,?,?,?,?,?)",
-                    (
-                        manifest_id,
-                        path,
-                        patch,
-                        diff_terms,
-                        f.get("status", "modified"),
-                        int(f.get("additions", 0)),
-                        int(f.get("deletions", 0)),
-                    ),
-                )
-        if parent_id and parent_id != manifest_id:
-            conn.execute(
-                "UPDATE pr_revision_manifests SET superseded_by_manifest_id=?, tombstoned_at=COALESCE(tombstoned_at,?), tombstone_reason=COALESCE(tombstone_reason,?) WHERE id=?",
-                (manifest_id, _now(), tombstone_reason, parent_id),
-            )
-        conn.execute(
-            """INSERT INTO prs(repo_id,number,state,title,body,url,head_sha,base_sha,source_updated_at,latest_manifest_id,evidence_version)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(repo_id,number) DO UPDATE SET state=excluded.state,title=excluded.title,body=excluded.body,url=excluded.url,head_sha=excluded.head_sha,base_sha=excluded.base_sha,source_updated_at=excluded.source_updated_at,latest_manifest_id=excluded.latest_manifest_id,evidence_version=excluded.evidence_version""",
-            (
-                repo_id,
-                pr_number,
-                state,
-                title,
-                body,
-                url,
-                head_sha,
-                base_sha,
-                source_updated_at,
-                manifest_id,
-                evidence_version,
-            ),
-        )
+        result = _upsert_pr_revision_conn(conn, repo, pr_number, **kwargs)
         conn.commit()
-        return {
-            "repo": repo,
-            "pr_number": pr_number,
-            "manifest_id": manifest_id,
-            "manifest_hash": mh,
-            "superseded_manifest_id": parent_id if parent_id != manifest_id else None,
-        }
+        return result
     finally:
         if close:
             conn.close()
@@ -369,7 +528,7 @@ def refresh_pr(
     try:
         init_db(conn)
         if revision:
-            upsert_pr_revision(conn, repo, pr_number, **revision)
+            _upsert_pr_revision_conn(conn, repo, pr_number, **revision)
         repo_id = _ensure_repo(conn, repo)
         row = conn.execute(
             "SELECT head_sha,base_sha,evidence_version FROM prs WHERE repo_id=? AND number=?",
@@ -408,6 +567,9 @@ def refresh_pr(
             "evidence_version": int(row[2]),
             "expires_at": issued + ttl_seconds,
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         if close:
             conn.close()
@@ -429,7 +591,7 @@ def _manifest_files(conn: sqlite3.Connection, manifest_id: int) -> list[dict[str
     return [
         dict(r)
         for r in conn.execute(
-            "SELECT path,patch_snippet,diff_terms,status,additions,deletions FROM pr_revision_hunks WHERE manifest_id=?",
+            "SELECT path,patch_hash,hunk_hash,patch_snippet,diff_terms,status,additions,deletions FROM pr_revision_hunks WHERE manifest_id=?",
             (manifest_id,),
         )
     ]
@@ -523,9 +685,8 @@ def search_pr_overlap(
     symbol anchors are matched against latest PR metadata and latest-live file
     hunks. Superseded manifests can surface only as `historical_overlap_only`.
     """
-    conn, close = _connect(db)
+    conn, close = _connect_existing(db, validate_schema=True)
     try:
-        init_db(conn)
         issue = {
             "issue_number": issue_number,
             "title": title,
@@ -696,9 +857,8 @@ def search_pr_overlap(
 def get_pr_evidence(
     db: str | Path | sqlite3.Connection, repo: str, pr_number: int
 ) -> dict[str, Any]:
-    conn, close = _connect(db)
+    conn, close = _connect_existing(db, validate_schema=True)
     try:
-        init_db(conn)
         owner, name = _repo_parts(repo)
         row = conn.execute(
             """SELECT p.*, r.owner||'/'||r.name AS repo, m.manifest_hash FROM prs p JOIN repos r ON r.id=p.repo_id JOIN pr_revision_manifests m ON m.id=p.latest_manifest_id WHERE r.owner=? AND r.name=? AND p.number=?""",
@@ -812,9 +972,8 @@ def record_refresh_failure(
 def get_dead_letters(
     db: str | Path | sqlite3.Connection, repo: str | None = None
 ) -> list[dict[str, Any]]:
-    conn, close = _connect(db)
+    conn, close = _connect_existing(db, validate_schema=True)
     try:
-        init_db(conn)
         params: tuple[Any, ...] = ()
         where = ""
         if repo:
@@ -866,9 +1025,8 @@ def replay_capsule(
     if isinstance(decoded, dict):
         return _replay_payload(decoded)
     capsule_id = capsule
-    conn, close = _connect(db)
+    conn, close = _connect_existing(db, validate_schema=True)
     try:
-        init_db(conn)
         row = conn.execute(
             "SELECT * FROM replay_capsules WHERE capsule_id=?", (capsule_id,)
         ).fetchone()
@@ -883,6 +1041,76 @@ def replay_capsule(
             "repo": payload.get("repo"),
             "pr_number": payload.get("pr_number"),
             "payload": payload,
+        }
+    finally:
+        if close:
+            conn.close()
+
+
+def gc_replay_capsules(
+    db: str | Path | sqlite3.Connection,
+    *,
+    older_than: float | None = None,
+    max_rows: int | None = None,
+    max_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Garbage-collect replay capsules without touching revision evidence."""
+    conn, close = _connect(db)
+    try:
+        init_db(conn)
+        delete_ids: set[str] = set()
+        if older_than is not None:
+            delete_ids.update(
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT capsule_id FROM replay_capsules WHERE emitted_at<?",
+                    (older_than,),
+                )
+            )
+        if max_rows is not None:
+            rows = list(
+                conn.execute(
+                    "SELECT capsule_id FROM replay_capsules ORDER BY emitted_at DESC"
+                )
+            )
+            for row in rows[max_rows:]:
+                delete_ids.add(str(row[0]))
+        if max_bytes is not None:
+            total = int(
+                _scalar(
+                    conn,
+                    "SELECT COALESCE(SUM(LENGTH(payload_json)),0) FROM replay_capsules",
+                )
+                or 0
+            )
+            if total > max_bytes:
+                rows = list(
+                    conn.execute(
+                        "SELECT capsule_id,LENGTH(payload_json) AS bytes FROM replay_capsules ORDER BY emitted_at ASC"
+                    )
+                )
+                for row in rows:
+                    if total <= max_bytes:
+                        break
+                    capsule_id = str(row["capsule_id"])
+                    if capsule_id not in delete_ids:
+                        delete_ids.add(capsule_id)
+                        total -= int(row["bytes"] or 0)
+        for capsule_id in sorted(delete_ids):
+            conn.execute(
+                "DELETE FROM replay_capsules WHERE capsule_id=?", (capsule_id,)
+            )
+        conn.commit()
+        return {
+            "deleted": len(delete_ids),
+            "remaining": int(_scalar(conn, "SELECT COUNT(*) FROM replay_capsules") or 0),
+            "historical_anchor_count": int(
+                _scalar(
+                    conn,
+                    "SELECT COUNT(*) FROM pr_revision_manifests WHERE superseded_by_manifest_id IS NOT NULL OR tombstoned_at IS NOT NULL",
+                )
+                or 0
+            ),
         }
     finally:
         if close:
@@ -940,3 +1168,6 @@ class PrOverlapIndex:
 
     def replay_capsule(self, capsule: str | dict[str, Any]) -> dict[str, Any]:
         return replay_capsule(self.db_path, capsule)
+
+    def gc_replay_capsules(self, **kwargs: Any) -> dict[str, Any]:
+        return gc_replay_capsules(self.db_path, **kwargs)

@@ -17,7 +17,6 @@ from typing import Any
 from pr_overlap_index import (
     get_pr_evidence,
     health_snapshot,
-    init_db,
     refresh_pr,
     search_pr_overlap,
 )
@@ -26,6 +25,18 @@ SERVER_NAME = "pr-overlap-index"
 SERVER_VERSION = "0.1.0"
 PROTOCOL_VERSION = "2024-11-05"
 TOOLS = ("search_pr_overlap", "get_pr_evidence", "refresh_pr", "health")
+REVISION_MUTATION_FIELDS = {
+    "title",
+    "body",
+    "state",
+    "files",
+    "head_sha",
+    "base_sha",
+    "source_updated_at",
+    "url",
+    "evidence_version",
+    "tombstone_reason",
+}
 
 
 def _db_path() -> Path:
@@ -82,7 +93,6 @@ def _content(payload: Any) -> dict[str, Any]:
 def _call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     args = dict(arguments or {})
     db = _db_path()
-    init_db(db)
     if name == "health":
         return _content(health())
     if name == "search_pr_overlap":
@@ -95,6 +105,25 @@ def _call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     if name == "get_pr_evidence":
         return _content(get_pr_evidence(db, args["repo"], int(args["pr_number"])))
     if name == "refresh_pr":
+        mutation = sorted(REVISION_MUTATION_FIELDS & set(args))
+        admin_mutation = os.environ.get("PR_OVERLAP_ENABLE_ADMIN_MUTATION") == "1"
+        if mutation and not admin_mutation:
+            return _content({
+                "repo": args.get("repo"),
+                "pr_number": args.get("pr_number"),
+                "refresh_status": "rejected",
+                "lease_id": None,
+                "reason": "revision mutation fields require admin mode",
+                "rejected_fields": mutation,
+            })
+        if not db.exists() and not admin_mutation:
+            return _content({
+                "repo": args.get("repo"),
+                "pr_number": args.get("pr_number"),
+                "refresh_status": "uninitialized",
+                "lease_id": None,
+                "reason": "PR overlap index is not initialized",
+            })
         return _content(
             refresh_pr(db, args.pop("repo"), int(args.pop("pr_number")), **args)
         )

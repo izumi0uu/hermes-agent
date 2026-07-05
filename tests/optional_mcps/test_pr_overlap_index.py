@@ -3,8 +3,11 @@ import importlib.util
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
+
+import pytest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -12,7 +15,9 @@ PKG = ROOT / "optional-mcps" / "pr-overlap-index"
 sys.path.insert(0, str(PKG))
 
 from pr_overlap_index import (  # noqa: E402
+    IndexNotInitializedError,
     PrOverlapIndex,
+    gc_replay_capsules,
     get_dead_letters,
     get_pr_evidence,
     health_snapshot,
@@ -22,6 +27,11 @@ from pr_overlap_index import (  # noqa: E402
     replay_capsule,
     search_pr_overlap,
     upsert_pr_revision,
+)
+from pr_overlap_index.indexer import (  # noqa: E402
+    GitHubRestClient,
+    RequestBudgetExceeded,
+    run_one_shot_indexer,
 )
 
 
@@ -198,16 +208,19 @@ def test_replay_capsule(tmp_path):
 
 
 def test_server_imports_without_mcp(tmp_path, monkeypatch):
-    monkeypatch.setenv("PR_OVERLAP_DB", str(tmp_path / "server-health.db"))
+    db = tmp_path / "server-health.db"
+    monkeypatch.setenv("PR_OVERLAP_DB", str(db))
     spec = importlib.util.spec_from_file_location(
         "pr_overlap_server", PKG / "server.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert mod.health()["ok"] is True
+    assert mod.health()["ok"] is False
     assert mod.health()["name"] == "pr-overlap-index"
-    assert mod.health()["schema_version"] == 1
+    assert mod.health()["initialized"] is False
+    assert mod.health()["schema_version"] is None
     assert "index_version" in mod.health()
+    assert not db.exists()
 
 
 def test_class_api_delegates(tmp_path):
@@ -353,12 +366,11 @@ def test_mcp_stdio_server_lists_tools_and_calls_health(tmp_path):
             },
         )
         payload = json.loads(health_result["result"]["content"][0]["text"])
-        assert payload["ok"] is True
+        assert payload["ok"] is False
+        assert payload["initialized"] is False
         assert payload["db_path"] == str(tmp_path / "stdio.db")
-        assert payload["schema_version"] == 1
-        assert payload["indexed_pr_count"] == 0
-        assert payload["latest_live_manifest_count"] == 0
-        assert payload["dead_letter_count"] == 0
+        assert payload["schema_version"] is None
+        assert not (tmp_path / "stdio.db").exists()
 
         ping = _jsonrpc(
             proc, {"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {}}
@@ -372,6 +384,87 @@ def test_mcp_stdio_server_lists_tools_and_calls_health(tmp_path):
     finally:
         proc.stdin.close()
         proc.wait(timeout=5)
+
+
+def test_query_and_health_do_not_create_missing_db(tmp_path):
+    db = tmp_path / "missing.db"
+    snapshot = health_snapshot(db)
+    assert snapshot["ok"] is False
+    assert snapshot["initialized"] is False
+    assert not db.exists()
+    with pytest.raises(IndexNotInitializedError):
+        search_pr_overlap(db, REPO, files=["cli.py"])
+    assert not db.exists()
+
+
+def test_mcp_search_query_does_not_create_db_when_index_missing(tmp_path):
+    db = tmp_path / "missing-stdio.db"
+    env = dict(os.environ, PR_OVERLAP_DB=str(db), PYTHONPATH=str(PKG))
+    proc = subprocess.Popen(
+        [sys.executable, str(PKG / "server.py")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        result = _jsonrpc(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_pr_overlap",
+                    "arguments": {"repo": REPO, "files": ["cli.py"]},
+                },
+            },
+        )
+        assert result["error"]["code"] == -32000
+        assert "not initialized" in result["error"]["message"]
+        assert not db.exists()
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
+def test_mcp_refresh_rejects_revision_mutation_by_default(tmp_path, monkeypatch):
+    db = tmp_path / "idx.db"
+    upsert_pr_revision(
+        db,
+        REPO,
+        30,
+        files=[{"path": "original.py", "patch_snippet": "ORIGINAL"}],
+        head_sha="h1",
+        base_sha="b1",
+    )
+    monkeypatch.setenv("PR_OVERLAP_DB", str(db))
+    monkeypatch.delenv("PR_OVERLAP_ENABLE_ADMIN_MUTATION", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "pr_overlap_server_reject", PKG / "server.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    payload = mod._call_tool(
+        "refresh_pr",
+        {
+            "repo": REPO,
+            "pr_number": 30,
+            "head_sha": "h2",
+            "base_sha": "b2",
+            "title": "mutated",
+            "files": [{"path": "mutated.py", "patch_snippet": "MUTATED"}],
+        },
+    )
+    body = json.loads(payload["content"][0]["text"])
+    assert body["refresh_status"] == "rejected"
+    assert set(body["rejected_fields"]) >= {"head_sha", "base_sha", "title", "files"}
+
+    ev = get_pr_evidence(db, REPO, 30)
+    assert ev["revision"]["head_sha"] == "h1"
+    assert [f["path"] for f in ev["files"]] == ["original.py"]
 
 
 def test_require_fresh_budget_false_surfaces_suggestion_only(tmp_path):
@@ -453,7 +546,7 @@ def test_health_snapshot_counts_index_state(tmp_path):
     snapshot = health_snapshot(db)
 
     assert snapshot["ok"] is True
-    assert snapshot["schema_version"] == 1
+    assert snapshot["schema_version"] == 2
     assert snapshot["index_version"]["score"] == "lexical-v1"
     assert snapshot["indexed_pr_count"] == 1
     assert snapshot["latest_live_manifest_count"] == 1
@@ -462,3 +555,251 @@ def test_health_snapshot_counts_index_state(tmp_path):
     assert snapshot["dead_letter_count"] == 1
     assert snapshot["last_sync_at"]
     assert snapshot["last_refreshed_at"]
+
+
+def test_refresh_revision_mutation_rolls_back_when_lease_insert_fails(
+    tmp_path, monkeypatch
+):
+    import pr_overlap_index.core as core
+
+    db = tmp_path / "idx.db"
+    upsert_pr_revision(
+        db,
+        REPO,
+        31,
+        files=[{"path": "old.py", "patch_snippet": "OldAnchor"}],
+        head_sha="h1",
+        base_sha="b1",
+    )
+
+    class FixedUUID:
+        hex = "fixedlease"
+
+    monkeypatch.setattr(core.uuid, "uuid4", lambda: FixedUUID())
+    refresh_pr(
+        db,
+        REPO,
+        31,
+        files=[{"path": "new.py", "patch_snippet": "NewAnchor"}],
+        head_sha="h2",
+        base_sha="b1",
+    )
+    with pytest.raises(Exception):
+        refresh_pr(
+            db,
+            REPO,
+            31,
+            files=[{"path": "broken.py", "patch_snippet": "BrokenAnchor"}],
+            head_sha="h3",
+            base_sha="b1",
+        )
+    ev = get_pr_evidence(db, REPO, 31)
+    assert ev["revision"]["head_sha"] == "h2"
+    assert [f["path"] for f in ev["files"]] == ["new.py"]
+    out = search_pr_overlap(db, REPO, files=["broken.py"], top_k=5)
+    assert out["results"] == []
+
+
+def test_refresh_revision_mutation_lease_matches_new_revision(tmp_path):
+    db = tmp_path / "idx.db"
+    upsert_pr_revision(
+        db,
+        REPO,
+        32,
+        files=[{"path": "old.py", "patch_snippet": "OldOnlyAnchor"}],
+        head_sha="h1",
+        base_sha="b1",
+    )
+    lease = refresh_pr(
+        db,
+        REPO,
+        32,
+        files=[{"path": "new.py", "patch_snippet": "NewOnlyAnchor"}],
+        head_sha="h2",
+        base_sha="b1",
+    )
+    ev = get_pr_evidence(db, REPO, 32)
+    assert lease["head_sha"] == "h2"
+    assert ev["revision"]["head_sha"] == lease["head_sha"]
+    hit = search_pr_overlap(
+        db,
+        REPO,
+        files=["new.py"],
+        error_messages=["NewOnlyAnchor"],
+        require_fresh=True,
+    )["results"][0]
+    assert hit["classification"] == "full-cover"
+    historical = search_pr_overlap(
+        db, REPO, files=["old.py"], error_messages=["OldOnlyAnchor"]
+    )["results"][0]
+    assert historical["classification"] == "historical_overlap_only"
+
+
+def test_capsule_gc_deletes_capsules_but_preserves_historical_overlap_anchors(tmp_path):
+    db = tmp_path / "idx.db"
+    upsert_pr_revision(
+        db,
+        REPO,
+        33,
+        files=[{"path": "old.py", "patch_snippet": "OldOnlyAnchor"}],
+        head_sha="h1",
+        base_sha="b1",
+        source_updated_at=1000,
+    )
+    refresh_pr(db, REPO, 33)
+    hit = search_pr_overlap(
+        db,
+        REPO,
+        files=["old.py"],
+        error_messages=["OldOnlyAnchor"],
+        require_fresh=True,
+    )["results"][0]
+    capsule_id = hit["capsule_id"]
+    upsert_pr_revision(
+        db,
+        REPO,
+        33,
+        files=[{"path": "new.py", "patch_snippet": "NewOnlyAnchor"}],
+        head_sha="h2",
+        base_sha="b1",
+        source_updated_at=2000,
+    )
+
+    gc = gc_replay_capsules(db, older_than=9999999999)
+    assert gc["deleted"] >= 1
+    with pytest.raises(KeyError):
+        replay_capsule(db, capsule_id)
+    historical = search_pr_overlap(
+        db, REPO, files=["old.py"], error_messages=["OldOnlyAnchor"], top_k=5
+    )["results"][0]
+    assert historical["classification"] == "historical_overlap_only"
+    assert historical["archive_allowed"] is False
+
+
+class FakePRClient:
+    def __init__(self, prs):
+        self.prs = prs
+
+    def iter_prs(self, repo, *, scope="open", since=None):
+        yield from self.prs
+
+
+def test_one_shot_indexer_stops_at_request_cap(tmp_path):
+    db = tmp_path / "idx.db"
+    prs = [
+        {
+            "number": i,
+            "title": f"PR {i}",
+            "head_sha": f"h{i}",
+            "base_sha": "b",
+            "files": [{"path": f"f{i}.py", "patch": "Anchor"}],
+        }
+        for i in range(40, 45)
+    ]
+    summary = run_one_shot_indexer(
+        db,
+        REPO,
+        client=FakePRClient(prs),
+        max_requests=2,
+        min_free_disk_bytes=0,
+    )
+    assert summary["capped"] is True
+    assert summary["stop_reason"] == "request_cap"
+    assert summary["requests_used"] == 2
+    assert health_snapshot(db)["indexed_pr_count"] == 2
+
+
+def test_one_shot_indexer_enforces_file_and_patch_byte_caps(tmp_path):
+    db = tmp_path / "idx.db"
+    summary = run_one_shot_indexer(
+        db,
+        REPO,
+        client=FakePRClient([
+            {
+                "number": 50,
+                "title": "caps",
+                "head_sha": "h",
+                "base_sha": "b",
+                "files": [
+                    {"path": "a.py", "patch": "A" * 100},
+                    {"path": "b.py", "patch": "B" * 100},
+                    {"path": "c.py", "patch": "C" * 100},
+                ],
+            }
+        ]),
+        max_files_per_pr=2,
+        max_patch_bytes=16,
+        max_total_patch_bytes=32,
+        min_free_disk_bytes=0,
+    )
+    assert summary["indexed"] == 1
+    assert summary["truncated_files"] == 2
+    assert summary["skipped_files"] == 1
+    ev = get_pr_evidence(db, REPO, 50)
+    assert len(ev["files"]) == 2
+    assert all(len(f["patch_snippet"].encode()) <= 16 for f in ev["files"])
+    assert all(f["patch_hash"] for f in ev["files"])
+    assert all(f["hunk_hash"] for f in ev["files"])
+
+
+def test_one_shot_indexer_refuses_overlapping_lock(tmp_path):
+    db = tmp_path / "idx.db"
+    init_db(db)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO indexer_locks(name,holder,acquired_at,heartbeat_at) VALUES(?,?,?,?)",
+        (f"indexer:{REPO}", "other", 9999999999, 9999999999),
+    )
+    conn.commit()
+    conn.close()
+    summary = run_one_shot_indexer(
+        db,
+        REPO,
+        client=FakePRClient([
+            {"number": 60, "head_sha": "h", "base_sha": "b", "files": []}
+        ]),
+        min_free_disk_bytes=0,
+    )
+    assert summary["capped"] is True
+    assert summary["stop_reason"] == "lock_held"
+    assert health_snapshot(db)["indexed_pr_count"] == 0
+
+
+class CountingGitHubClient(GitHubRestClient):
+    def __init__(self):
+        super().__init__(token=None)
+
+    def _json(self, url):
+        if self.max_requests is not None and self.requests_used >= self.max_requests:
+            raise RequestBudgetExceeded("budget exhausted")
+        self.requests_used += 1
+        if url.endswith("/files"):
+            return [{"filename": "a.py", "patch": "Anchor"}]
+        return [
+            {
+                "number": 70,
+                "title": "budget",
+                "body": "",
+                "state": "open",
+                "head": {"sha": "h"},
+                "base": {"sha": "b"},
+                "url": "https://api.github.example/repos/o/r/pulls/70",
+                "html_url": "https://github.example/o/r/pull/70",
+            }
+        ]
+
+
+def test_github_rest_client_request_budget_counts_page_and_files_requests(tmp_path):
+    db = tmp_path / "idx.db"
+    client = CountingGitHubClient()
+    summary = run_one_shot_indexer(
+        db,
+        REPO,
+        client=client,
+        max_requests=1,
+        min_free_disk_bytes=0,
+    )
+    assert summary["capped"] is True
+    assert summary["stop_reason"] == "request_cap"
+    assert summary["requests_used"] == 1
+    assert health_snapshot(db)["indexed_pr_count"] == 0
