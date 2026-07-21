@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+BUNDLE_SCHEMA_VERSION = 1
 SCORE_VERSION = "lexical-v1"
 MATCHER_VERSION = "compact-v1"
 NORMALIZATION_VERSION = "text-v1"
@@ -149,6 +152,22 @@ def _terms(values: Iterable[Any]) -> set[str]:
     return out
 
 
+def _scope_profile(scope: str) -> str:
+    aliases = {
+        "open": "hot_open",
+        "hot": "hot_open",
+        "hot_open": "hot_open",
+        "recent": "recent_closed",
+        "recent_closed": "recent_closed",
+        "closed": "recent_closed",
+        "cold": "cold_archive",
+        "cold_archive": "cold_archive",
+        "targeted": "targeted_refresh",
+        "targeted_refresh": "targeted_refresh",
+    }
+    return aliases.get(scope, scope)
+
+
 def _repo_parts(repo: str) -> tuple[str, str]:
     if "/" not in repo:
         return "", repo
@@ -233,6 +252,31 @@ def init_db(db: str | Path | sqlite3.Connection) -> None:
               id INTEGER PRIMARY KEY, sampled_at REAL NOT NULL, metric TEXT NOT NULL,
               value REAL NOT NULL, detail TEXT DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS pr_scope_membership(
+              repo_id INTEGER NOT NULL, pr_number INTEGER NOT NULL, scope TEXT NOT NULL,
+              first_indexed_at REAL NOT NULL, last_indexed_at REAL NOT NULL,
+              source_updated_at REAL DEFAULT 0,
+              PRIMARY KEY(repo_id, pr_number, scope)
+            );
+            CREATE TABLE IF NOT EXISTS pr_revision_terms(
+              manifest_id INTEGER NOT NULL, term TEXT NOT NULL,
+              PRIMARY KEY(manifest_id, term)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pr_revision_terms_term
+              ON pr_revision_terms(term, manifest_id);
+            CREATE TABLE IF NOT EXISTS indexer_runs(
+              id INTEGER PRIMARY KEY, repo TEXT NOT NULL, scope TEXT NOT NULL,
+              profile TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL NOT NULL,
+              indexed INTEGER NOT NULL, requests_used INTEGER NOT NULL,
+              capped INTEGER NOT NULL, stop_reason TEXT NOT NULL,
+              max_requests INTEGER, max_runtime_seconds INTEGER, max_rss_mb INTEGER,
+              min_free_disk_bytes INTEGER, batch_limit INTEGER, max_files_per_pr INTEGER,
+              max_patch_bytes INTEGER, db_bytes INTEGER DEFAULT 0,
+              wal_bytes INTEGER DEFAULT 0, free_disk_bytes INTEGER DEFAULT 0,
+              detail_json TEXT DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_indexer_runs_repo_scope_finished
+              ON indexer_runs(repo, scope, finished_at DESC);
             """
         )
         if "patch_hash" not in _columns(conn, "pr_revision_hunks"):
@@ -290,6 +334,9 @@ def health_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
             for ts in (latest_refresh, latest_source_update, latest_lease, latest_dlq)
             if ts
         ]
+        coverage = _coverage_by_scope(conn)
+        last_runs = _last_runs_by_scope(conn)
+        sizes = _db_size_snapshot(db)
         return {
             "ok": True,
             "initialized": True,
@@ -339,10 +386,158 @@ def health_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
             "last_refreshed_at": latest_refresh,
             "last_source_updated_at": latest_source_update,
             "last_sync_at": max(timestamps) if timestamps else None,
+            "coverage_by_scope": coverage,
+            "last_run_by_scope": last_runs,
+            **sizes,
+            "brownout_state": _brownout_state(sizes),
+            "archive_confidence_floor": _archive_confidence_floor(coverage),
         }
     finally:
         if close:
             conn.close()
+
+
+def _db_family_paths(db: str | Path) -> list[Path]:
+    path = Path(db)
+    return [path, Path(f"{path}-wal"), Path(f"{path}-shm")]
+
+
+def _import_lock_path(db: str | Path) -> Path:
+    return Path(f"{Path(db)}.import.lock")
+
+
+def _import_lockfile_exists(db: str | Path | sqlite3.Connection) -> bool:
+    if isinstance(db, sqlite3.Connection):
+        try:
+            for row in db.execute("PRAGMA database_list"):
+                name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+                path = row["file"] if isinstance(row, sqlite3.Row) else row[2]
+                if name == "main" and path:
+                    return _import_lock_path(path).exists()
+        except sqlite3.Error:
+            return False
+        return False
+    return _import_lock_path(db).exists()
+
+
+def _path_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _db_size_snapshot(db: str | Path | sqlite3.Connection) -> dict[str, Any]:
+    if isinstance(db, sqlite3.Connection):
+        return {
+            "db_bytes": None,
+            "wal_bytes": None,
+            "shm_bytes": None,
+            "free_disk_bytes": None,
+        }
+    path = Path(db)
+    parent = path.expanduser().resolve().parent
+    try:
+        stat = os.statvfs(parent)
+        free_disk_bytes = int(stat.f_bavail * stat.f_frsize)
+    except OSError:
+        free_disk_bytes = None
+    return {
+        "db_bytes": _path_size(path),
+        "wal_bytes": _path_size(Path(f"{path}-wal")),
+        "shm_bytes": _path_size(Path(f"{path}-shm")),
+        "free_disk_bytes": free_disk_bytes,
+    }
+
+
+def _brownout_state(sizes: dict[str, Any], min_free_disk_bytes: int = 4 * 1024 * 1024 * 1024) -> str:
+    free = sizes.get("free_disk_bytes")
+    if free is None:
+        return "unknown"
+    return "disk_brownout" if int(free) < min_free_disk_bytes else "ok"
+
+
+def _coverage_by_scope(conn: sqlite3.Connection) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for row in conn.execute(
+        """SELECT scope, COUNT(*) AS coverage_count,
+                  MIN(source_updated_at) AS oldest_source_updated_at,
+                  MAX(source_updated_at) AS newest_source_updated_at,
+                  MAX(last_indexed_at) AS coverage_as_of
+           FROM pr_scope_membership GROUP BY scope"""
+    ):
+        scope = str(row["scope"])
+        oldest = row["oldest_source_updated_at"]
+        newest = row["newest_source_updated_at"]
+        out[scope] = {
+            "coverage_count": int(row["coverage_count"] or 0),
+            "coverage_window": {
+                "oldest_source_updated_at": oldest,
+                "newest_source_updated_at": newest,
+            },
+            "coverage_as_of": row["coverage_as_of"],
+            "coverage_denominator_kind": "unknown",
+            "coverage_denominator": None,
+            "coverage_source": scope,
+            "serving_active": scope != "cold_archive",
+            "serving_gate": (
+                "passed" if scope != "cold_archive" else "cold_scale_gate_required"
+            ),
+        }
+    if not out:
+        count = int(_scalar(conn, "SELECT COUNT(*) FROM prs") or 0)
+        newest = _scalar(conn, "SELECT MAX(source_updated_at) FROM prs")
+        oldest = _scalar(conn, "SELECT MIN(source_updated_at) FROM prs")
+        if count:
+            out["legacy"] = {
+                "coverage_count": count,
+                "coverage_window": {
+                    "oldest_source_updated_at": oldest,
+                    "newest_source_updated_at": newest,
+                },
+                "coverage_as_of": newest,
+                "coverage_denominator_kind": "unknown",
+                "coverage_denominator": None,
+                "coverage_source": "legacy",
+                "serving_active": True,
+                "serving_gate": "legacy",
+            }
+    return out
+
+
+def _last_runs_by_scope(conn: sqlite3.Connection) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for row in conn.execute(
+        """SELECT * FROM indexer_runs r
+           WHERE id IN (
+             SELECT MAX(id) FROM indexer_runs GROUP BY repo, scope
+           )
+           ORDER BY finished_at DESC"""
+    ):
+        out[str(row["scope"])] = {
+            "repo": row["repo"],
+            "profile": row["profile"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "indexed": int(row["indexed"]),
+            "requests_used": int(row["requests_used"]),
+            "capped": bool(row["capped"]),
+            "stop_reason": row["stop_reason"],
+            "db_bytes": int(row["db_bytes"] or 0),
+            "wal_bytes": int(row["wal_bytes"] or 0),
+            "free_disk_bytes": int(row["free_disk_bytes"] or 0),
+        }
+    return out
+
+
+def _archive_confidence_floor(coverage: dict[str, Any]) -> str:
+    if coverage.get("cold_archive", {}).get("serving_active"):
+        return "hot_plus_cold"
+    if "recent_closed" in coverage:
+        return "hot_plus_recent"
+    if "hot_open" in coverage:
+        return "hot_only"
+    return "unknown"
 
 
 def _upsert_pr_revision_conn(
@@ -360,10 +555,11 @@ def _upsert_pr_revision_conn(
     url: str = "",
     evidence_version: int = 1,
     tombstone_reason: str = "superseded",
+    index_scope: str | None = None,
 ) -> dict[str, Any]:
     repo_id = _ensure_repo(conn, repo)
     files = files or []
-    source_updated_at = source_updated_at or _now()
+    source_updated_at = 0.0 if source_updated_at is None else float(source_updated_at)
     previous = conn.execute(
         "SELECT latest_manifest_id FROM prs WHERE repo_id=? AND number=?",
         (repo_id, pr_number),
@@ -440,6 +636,19 @@ def _upsert_pr_revision_conn(
                     f["deletions"],
                 ),
             )
+        manifest_terms = _terms([
+            title,
+            body,
+            head_sha,
+            base_sha,
+            [f["path"] for f in canonical_files],
+            [f["patch_snippet"] for f in canonical_files],
+            [f["diff_terms"] for f in canonical_files],
+        ])
+        conn.executemany(
+            "INSERT OR IGNORE INTO pr_revision_terms(manifest_id,term) VALUES(?,?)",
+            [(manifest_id, term) for term in manifest_terms],
+        )
     if parent_id and parent_id != manifest_id:
         conn.execute(
             "UPDATE pr_revision_manifests SET superseded_by_manifest_id=?, tombstoned_at=COALESCE(tombstoned_at,?), tombstone_reason=COALESCE(tombstone_reason,?) WHERE id=?",
@@ -463,6 +672,17 @@ def _upsert_pr_revision_conn(
             evidence_version,
         ),
     )
+    if index_scope:
+        scope = _scope_profile(index_scope)
+        now = _now()
+        conn.execute(
+            """INSERT INTO pr_scope_membership(repo_id,pr_number,scope,first_indexed_at,last_indexed_at,source_updated_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(repo_id,pr_number,scope) DO UPDATE SET
+                 last_indexed_at=excluded.last_indexed_at,
+                 source_updated_at=excluded.source_updated_at""",
+            (repo_id, pr_number, scope, now, now, source_updated_at),
+        )
     return {
         "repo": repo,
         "pr_number": pr_number,
@@ -470,6 +690,79 @@ def _upsert_pr_revision_conn(
         "manifest_hash": mh,
         "superseded_manifest_id": parent_id if parent_id != manifest_id else None,
     }
+
+
+def record_indexer_run(
+    db: str | Path | sqlite3.Connection,
+    repo: str,
+    scope: str,
+    *,
+    profile: str | None = None,
+    started_at: float,
+    finished_at: float,
+    indexed: int,
+    requests_used: int,
+    capped: bool,
+    stop_reason: str,
+    max_requests: int | None = None,
+    max_runtime_seconds: int | None = None,
+    max_rss_mb: int | None = None,
+    min_free_disk_bytes: int | None = None,
+    batch_limit: int | None = None,
+    max_files_per_pr: int | None = None,
+    max_patch_bytes: int | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    conn, close = _connect(db)
+    try:
+        init_db(conn)
+        sizes = _db_size_snapshot(db)
+        normalized = _scope_profile(scope)
+        cur = conn.execute(
+            """INSERT INTO indexer_runs(repo,scope,profile,started_at,finished_at,indexed,requests_used,capped,stop_reason,
+               max_requests,max_runtime_seconds,max_rss_mb,min_free_disk_bytes,batch_limit,max_files_per_pr,max_patch_bytes,
+               db_bytes,wal_bytes,free_disk_bytes,detail_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                repo,
+                normalized,
+                profile or normalized,
+                started_at,
+                finished_at,
+                indexed,
+                requests_used,
+                int(capped),
+                stop_reason,
+                max_requests,
+                max_runtime_seconds,
+                max_rss_mb,
+                min_free_disk_bytes,
+                batch_limit,
+                max_files_per_pr,
+                max_patch_bytes,
+                sizes.get("db_bytes") or 0,
+                sizes.get("wal_bytes") or 0,
+                sizes.get("free_disk_bytes") or 0,
+                _json(detail or {}),
+            ),
+        )
+        conn.commit()
+        return {
+            "id": int(cur.lastrowid),
+            "repo": repo,
+            "scope": normalized,
+            "profile": profile or normalized,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "indexed": indexed,
+            "requests_used": requests_used,
+            "capped": capped,
+            "stop_reason": stop_reason,
+            **sizes,
+        }
+    finally:
+        if close:
+            conn.close()
 
 
 def upsert_pr_revision(
@@ -575,16 +868,103 @@ def refresh_pr(
             conn.close()
 
 
+def _serving_scope_sql(alias: str = "p") -> str:
+    return f"""(
+             NOT EXISTS (
+               SELECT 1 FROM pr_scope_membership sm
+               WHERE sm.repo_id={alias}.repo_id AND sm.pr_number={alias}.number
+             )
+             OR EXISTS (
+               SELECT 1 FROM pr_scope_membership sm
+               WHERE sm.repo_id={alias}.repo_id AND sm.pr_number={alias}.number
+                 AND sm.scope!='cold_archive'
+             )
+           )"""
+
+
 def _candidate_rows(conn: sqlite3.Connection, repo: str) -> list[sqlite3.Row]:
     owner, name = _repo_parts(repo)
     return list(
         conn.execute(
             """SELECT p.*, r.owner||'/'||r.name AS repo, m.manifest_hash
-           FROM prs p JOIN repos r ON r.id=p.repo_id JOIN pr_revision_manifests m ON m.id=p.latest_manifest_id
-           WHERE r.owner=? AND r.name=?""",
+	           FROM prs p JOIN repos r ON r.id=p.repo_id JOIN pr_revision_manifests m ON m.id=p.latest_manifest_id
+	           WHERE r.owner=? AND r.name=? AND """
+            + _serving_scope_sql("p"),
             (owner, name),
         )
     )
+
+
+def _latest_manifest_term_coverage(
+    conn: sqlite3.Connection, repo: str
+) -> tuple[int, int]:
+    owner, name = _repo_parts(repo)
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT p.latest_manifest_id) AS latest_count,
+                  COUNT(DISTINCT t.manifest_id) AS term_indexed_count
+           FROM prs p
+           JOIN repos r ON r.id=p.repo_id
+           LEFT JOIN pr_revision_terms t ON t.manifest_id=p.latest_manifest_id
+	           WHERE r.owner=? AND r.name=? AND p.latest_manifest_id IS NOT NULL
+	             AND """
+            + _serving_scope_sql("p"),
+        (owner, name),
+    ).fetchone()
+    if not row:
+        return 0, 0
+    return int(row["latest_count"] or 0), int(row["term_indexed_count"] or 0)
+
+
+def _candidate_rows_for_terms(
+    conn: sqlite3.Connection, repo: str, terms: set[str]
+) -> tuple[list[sqlite3.Row], dict[str, Any]]:
+    """Return latest-live PR rows narrowed by indexed terms when safe.
+
+    Term narrowing is an optimization only. If a migrated/mixed DB has any
+    latest manifests without term rows, fall back to all latest-live candidates
+    so overlap search keeps recall over speed.
+    """
+    meta = {
+        "enabled": False,
+        "terms_considered": len(terms),
+        "reason": "no_terms",
+        "latest_manifest_count": 0,
+        "term_indexed_manifest_count": 0,
+    }
+    if not terms:
+        return _candidate_rows(conn, repo), meta
+    latest_count, term_indexed_count = _latest_manifest_term_coverage(conn, repo)
+    meta["latest_manifest_count"] = latest_count
+    meta["term_indexed_manifest_count"] = term_indexed_count
+    if len(terms) > 80:
+        meta["reason"] = "too_many_terms"
+        return _candidate_rows(conn, repo), meta
+    if latest_count != term_indexed_count:
+        meta["reason"] = "incomplete_term_index"
+        return _candidate_rows(conn, repo), meta
+    owner, name = _repo_parts(repo)
+    selected = sorted(terms)[:80]
+    placeholders = ",".join("?" for _ in selected)
+    rows = list(
+        conn.execute(
+            f"""SELECT DISTINCT p.*, r.owner||'/'||r.name AS repo, m.manifest_hash
+               FROM pr_revision_terms t
+               JOIN pr_revision_manifests m ON m.id=t.manifest_id
+               JOIN prs p ON p.repo_id=m.repo_id AND p.number=m.pr_number
+                    AND p.latest_manifest_id=m.id
+               JOIN repos r ON r.id=p.repo_id
+	               WHERE r.owner=? AND r.name=? AND t.term IN ({placeholders})
+	                 AND """
+                + _serving_scope_sql("p"),
+	            (owner, name, *selected),
+	        )
+	    )
+    if not rows:
+        meta["reason"] = "no_term_matches"
+        return _candidate_rows(conn, repo), meta
+    meta["enabled"] = True
+    meta["reason"] = "term_match"
+    return rows, meta
 
 
 def _manifest_files(conn: sqlite3.Connection, manifest_id: int) -> list[dict[str, Any]]:
@@ -687,6 +1067,8 @@ def search_pr_overlap(
     """
     conn, close = _connect_existing(db, validate_schema=True)
     try:
+        import_locked = _import_lockfile_exists(db)
+        mutated = False
         issue = {
             "issue_number": issue_number,
             "title": title,
@@ -722,7 +1104,10 @@ def search_pr_overlap(
                 return "fresh"
             return "needs_refresh"
 
-        for row in _candidate_rows(conn, repo):
+        candidate_rows, candidate_prefilter = _candidate_rows_for_terms(
+            conn, repo, strong or all_terms
+        )
+        for row in candidate_rows:
             frows = _manifest_files(conn, int(row["latest_manifest_id"]))
             haystack = _terms([
                 row["title"],
@@ -756,29 +1141,38 @@ def search_pr_overlap(
                 if not lease:
                     classification = "needs-refresh"
                     freshness = "needs_refresh"
-                    if refresh_failure_reason:
+                    if import_locked:
+                        refresh_status = "import_lock_held"
+                    elif refresh_failure_reason:
                         dead_letter = record_refresh_failure(
                             conn, repo, int(row["number"]), refresh_failure_reason
                         )
                         refresh_status = "dead_lettered"
+                        mutated = True
                     elif not refresh_budget_available:
                         refresh_status = "suggestion_only"
                     else:
                         refresh_status = "missing"
                 else:
-                    refresh_status = "fresh"
-                    capsule_id = _capsule(
-                        conn,
-                        row,
-                        issue,
-                        sorted(set(matched_terms)),
-                        unmatched,
-                        classification,
-                        min(0.99, 0.55 + score / 20),
-                        lease["lease_id"],
-                    )
-                    archive_allowed = True
-                    freshness = "fresh"
+                    if import_locked:
+                        classification = "needs-refresh"
+                        refresh_status = "import_lock_held"
+                        freshness = "needs_refresh"
+                    else:
+                        refresh_status = "fresh"
+                        capsule_id = _capsule(
+                            conn,
+                            row,
+                            issue,
+                            sorted(set(matched_terms)),
+                            unmatched,
+                            classification,
+                            min(0.99, 0.55 + score / 20),
+                            lease["lease_id"],
+                        )
+                        mutated = True
+                        archive_allowed = True
+                        freshness = "fresh"
             elif classification == "full-cover" and not require_fresh:
                 if freshness != "fresh" or not lease:
                     classification = "needs-refresh"
@@ -810,9 +1204,15 @@ def search_pr_overlap(
         # Historical evidence is advisory only.
         owner, name = _repo_parts(repo)
         for h in conn.execute(
-            """SELECT r.owner||'/'||r.name AS repo,m.*,p.number AS current_number FROM pr_revision_manifests m JOIN repos r ON r.id=m.repo_id JOIN prs p ON p.repo_id=m.repo_id AND p.number=m.pr_number WHERE r.owner=? AND r.name=? AND m.superseded_by_manifest_id IS NOT NULL""",
-            (owner, name),
-        ):
+	            """SELECT r.owner||'/'||r.name AS repo,m.*,p.number AS current_number
+	               FROM pr_revision_manifests m
+	               JOIN repos r ON r.id=m.repo_id
+	               JOIN prs p ON p.repo_id=m.repo_id AND p.number=m.pr_number
+	               WHERE r.owner=? AND r.name=? AND m.superseded_by_manifest_id IS NOT NULL
+	                 AND """
+                + _serving_scope_sql("p"),
+	            (owner, name),
+	        ):
             frows = _manifest_files(conn, int(h["id"]))
             haystack = _terms([
                 h["head_sha"],
@@ -842,12 +1242,14 @@ def search_pr_overlap(
                     "archive_allowed": False,
                 })
         results.sort(key=lambda r: (r["archive_allowed"], r["score"]), reverse=True)
-        conn.commit()
+        if mutated:
+            conn.commit()
         return {
             "repo": repo,
             "query": issue,
             "results": results[:top_k],
             "result_count": min(len(results), top_k),
+            "candidate_prefilter": candidate_prefilter,
         }
     finally:
         if close:
@@ -1115,6 +1517,412 @@ def gc_replay_capsules(
     finally:
         if close:
             conn.close()
+
+
+def import_disk_preflight(
+    live_db: str | Path,
+    staging_db: str | Path,
+    *,
+    min_free_disk_bytes: int = 4 * 1024 * 1024 * 1024,
+) -> dict[str, Any]:
+    """Check whether an import can safely hold live, staging, rollback, and reserve.
+
+    This is a conservative preflight used before copying or activating a cold
+    import artifact on a small VPS.  It performs only local filesystem checks.
+    """
+    live = Path(live_db)
+    staging = Path(staging_db)
+    live_family_bytes = sum(_path_size(p) for p in _db_family_paths(live))
+    staging_family_bytes = sum(_path_size(p) for p in _db_family_paths(staging))
+    try:
+        usage = os.statvfs(live.expanduser().resolve().parent)
+        free_disk_bytes = int(usage.f_bavail * usage.f_frsize)
+    except OSError:
+        free_disk_bytes = 0
+    required_bytes = (
+        live_family_bytes
+        + staging_family_bytes
+        + live_family_bytes
+        + min_free_disk_bytes
+    )
+    ok = free_disk_bytes >= required_bytes
+    return {
+        "ok": ok,
+        "reason": "ok" if ok else "insufficient_disk",
+        "live_family_bytes": live_family_bytes,
+        "staging_family_bytes": staging_family_bytes,
+        "rollback_family_bytes": live_family_bytes,
+        "min_free_disk_bytes": min_free_disk_bytes,
+        "required_free_disk_bytes": required_bytes,
+        "free_disk_bytes": free_disk_bytes,
+    }
+
+
+def validate_staging_import_db(staging_db: str | Path) -> dict[str, Any]:
+    """Validate a staging DB before import activation."""
+    path = Path(staging_db)
+    if not path.exists():
+        return {"ok": False, "reason": "missing_staging_db"}
+    conn = sqlite3.connect(str(path))
+    try:
+        _configure_connection(conn)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            return {"ok": False, "reason": "integrity_check_failed", "detail": integrity}
+        try:
+            _validate_schema(conn)
+        except IndexNotInitializedError as exc:
+            return {"ok": False, "reason": "schema_validation_failed", "detail": str(exc)}
+        return {"ok": True, "reason": "ok", "schema_version": SCHEMA_VERSION}
+    finally:
+        conn.close()
+
+
+def _checkpoint_db(path: Path) -> None:
+    if not path.exists():
+        return
+    conn = sqlite3.connect(str(path))
+    try:
+        _configure_connection(conn)
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
+def _unlink_db_sidecars(path: Path) -> None:
+    for sidecar in _db_family_paths(path)[1:]:
+        sidecar.unlink(missing_ok=True)
+
+
+def _active_locks(
+    conn: sqlite3.Connection, *, now: float | None = None, stale_after_seconds: int = 900
+) -> list[sqlite3.Row]:
+    now = _now() if now is None else now
+    conn.execute(
+        "DELETE FROM indexer_locks WHERE heartbeat_at<?",
+        (now - stale_after_seconds,),
+    )
+    return list(conn.execute("SELECT * FROM indexer_locks ORDER BY name"))
+
+
+def _acquire_import_lockfile(
+    db: str | Path, *, holder: str, stale_after_seconds: int = 900
+) -> tuple[bool, str]:
+    lock_path = _import_lock_path(db)
+    now = _now()
+    _ = stale_after_seconds
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_json({"holder": holder, "acquired_at": now}))
+    except FileExistsError:
+        return False, f"active_lockfile:{lock_path}"
+    return True, str(lock_path)
+
+
+def _live_db_lock_conflict(
+    db: str | Path, *, stale_after_seconds: int = 900
+) -> str | None:
+    path = Path(db)
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(str(path))
+    _configure_connection(conn)
+    if not _table_exists(conn, "indexer_locks"):
+        conn.close()
+        return None
+    now = _now()
+    locks = _active_locks(conn, now=now, stale_after_seconds=stale_after_seconds)
+    conn.commit()
+    conn.close()
+    if locks:
+        names = ",".join(str(row["name"]) for row in locks)
+        return f"active_lock:{names}"
+    return None
+
+
+def _release_import_lockfile(db: str | Path) -> None:
+    _import_lock_path(db).unlink(missing_ok=True)
+
+
+def _repo_names(conn: sqlite3.Connection) -> list[str]:
+    return [
+        f"{row['owner']}/{row['name']}"
+        for row in conn.execute("SELECT owner,name FROM repos ORDER BY owner,name")
+    ]
+
+
+def _import_manifest_for_db(db: str | Path) -> dict[str, Any]:
+    conn = open_existing_index_db(db, validate_schema=True)
+    try:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "index_version": INDEX_VERSION,
+            "repos": _repo_names(conn),
+            "row_counts": {
+                "repos": int(_scalar(conn, "SELECT COUNT(*) FROM repos") or 0),
+                "prs": int(_scalar(conn, "SELECT COUNT(*) FROM prs") or 0),
+                "manifests": int(
+                    _scalar(conn, "SELECT COUNT(*) FROM pr_revision_manifests") or 0
+                ),
+                "hunks": int(
+                    _scalar(conn, "SELECT COUNT(*) FROM pr_revision_hunks") or 0
+                ),
+                "terms": int(
+                    _scalar(conn, "SELECT COUNT(*) FROM pr_revision_terms") or 0
+                ),
+            },
+            **_db_size_snapshot(db),
+        }
+    finally:
+        conn.close()
+
+
+def export_cold_import_bundle(
+    source_db: str | Path,
+    bundle_dir: str | Path,
+    *,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """Export a validated DB artifact for later cold import activation."""
+    source = Path(source_db)
+    bundle = Path(bundle_dir)
+    if not source.exists():
+        return {"ok": False, "reason": "missing_source_db"}
+    bundle.mkdir(parents=True, exist_ok=True)
+    artifact = bundle / "pr-overlap-import.db"
+    manifest_path = bundle / "manifest.json"
+    tmp_artifact = bundle / f".{artifact.name}.{uuid.uuid4().hex}.tmp"
+    _checkpoint_db(source)
+    source_conn = open_existing_index_db(source, validate_schema=True)
+    tmp_conn = sqlite3.connect(str(tmp_artifact))
+    try:
+        source_conn.backup(tmp_conn)
+    finally:
+        tmp_conn.close()
+        source_conn.close()
+    validation = validate_staging_import_db(tmp_artifact)
+    if not validation.get("ok"):
+        _unlink_db_sidecars(tmp_artifact)
+        tmp_artifact.unlink(missing_ok=True)
+        return {"ok": False, "reason": "artifact_validation_failed", "validation": validation}
+    manifest = _import_manifest_for_db(tmp_artifact)
+    if repo and repo not in manifest["repos"]:
+        _unlink_db_sidecars(tmp_artifact)
+        tmp_artifact.unlink(missing_ok=True)
+        return {"ok": False, "reason": "repo_not_in_source", "repo": repo}
+    manifest.update({
+        "bundle_schema_version": BUNDLE_SCHEMA_VERSION,
+        "artifact": artifact.name,
+        "source_db": str(source),
+        "created_at": _now(),
+    })
+    _unlink_db_sidecars(tmp_artifact)
+    os.replace(tmp_artifact, artifact)
+    tmp_manifest = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_manifest.write_text(_json(manifest), encoding="utf-8")
+    os.replace(tmp_manifest, manifest_path)
+    return {
+        "ok": True,
+        "reason": "ok",
+        "bundle_dir": str(bundle),
+        "artifact": str(artifact),
+        "manifest": str(manifest_path),
+        **manifest,
+    }
+
+
+def validate_cold_import_bundle(
+    bundle_dir: str | Path,
+    *,
+    expected_repo: str | None = None,
+) -> dict[str, Any]:
+    """Validate a cold import bundle manifest and SQLite artifact."""
+    bundle = Path(bundle_dir)
+    manifest_path = bundle / "manifest.json"
+    if not manifest_path.exists():
+        return {"ok": False, "reason": "missing_manifest"}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "reason": "invalid_manifest", "detail": str(exc)}
+    if manifest.get("bundle_schema_version") != BUNDLE_SCHEMA_VERSION:
+        return {
+            "ok": False,
+            "reason": "unsupported_bundle_schema",
+            "expected": BUNDLE_SCHEMA_VERSION,
+            "actual": manifest.get("bundle_schema_version"),
+        }
+    raw_artifact = str(manifest.get("artifact") or "pr-overlap-import.db")
+    artifact_name = Path(raw_artifact)
+    if artifact_name.is_absolute():
+        return {"ok": False, "reason": "artifact_outside_bundle", "artifact": raw_artifact}
+    bundle_root = bundle.resolve()
+    artifact = (bundle / artifact_name).resolve()
+    try:
+        artifact.relative_to(bundle_root)
+    except ValueError:
+        return {"ok": False, "reason": "artifact_outside_bundle", "artifact": raw_artifact}
+    validation = validate_staging_import_db(artifact)
+    if not validation.get("ok"):
+        return {"ok": False, "reason": "artifact_validation_failed", "validation": validation}
+    actual = _import_manifest_for_db(artifact)
+    for key in ("schema_version", "index_version", "repos", "row_counts"):
+        if manifest.get(key) != actual.get(key):
+            return {
+                "ok": False,
+                "reason": "manifest_mismatch",
+                "field": key,
+                "expected": manifest.get(key),
+                "actual": actual.get(key),
+            }
+    if expected_repo and expected_repo not in actual["repos"]:
+        return {"ok": False, "reason": "repo_not_in_bundle", "repo": expected_repo}
+    return {
+        "ok": True,
+        "reason": "ok",
+        "bundle_dir": str(bundle),
+        "artifact": str(artifact),
+        "manifest": manifest,
+        "actual": actual,
+    }
+
+
+def _copy_db_family(src_db: Path, dst_db: Path) -> list[str]:
+    copied: list[str] = []
+    dst_db.parent.mkdir(parents=True, exist_ok=True)
+    for src in _db_family_paths(src_db):
+        suffix = src.name[len(src_db.name):]
+        dst = dst_db.parent / f"{dst_db.name}{suffix}"
+        if src.exists():
+            shutil.copy2(src, dst)
+            copied.append(str(dst))
+        elif dst.exists():
+            dst.unlink()
+    return copied
+
+
+def activate_cold_import_bundle(
+    live_db: str | Path,
+    bundle_dir: str | Path,
+    *,
+    expected_repo: str | None = None,
+    rollback_dir: str | Path | None = None,
+    min_free_disk_bytes: int = 4 * 1024 * 1024 * 1024,
+) -> dict[str, Any]:
+    """Atomically activate a validated cold import bundle with rollback backup."""
+    live = Path(live_db)
+    holder = uuid.uuid4().hex
+    locked, lock_reason = _acquire_import_lockfile(live, holder=holder)
+    if not locked:
+        return {
+            "ok": False,
+            "reason": "import_lock_held",
+            "detail": lock_reason,
+        }
+    try:
+        bundle_validation = validate_cold_import_bundle(
+            bundle_dir, expected_repo=expected_repo
+        )
+        if not bundle_validation.get("ok"):
+            return {
+                "ok": False,
+                "reason": "bundle_validation_failed",
+                "validation": bundle_validation,
+            }
+        lock_conflict = _live_db_lock_conflict(live)
+        if lock_conflict:
+            return {
+                "ok": False,
+                "reason": "import_lock_held",
+                "detail": lock_conflict,
+            }
+        staging = Path(str(bundle_validation["artifact"]))
+        preflight = import_disk_preflight(
+            live, staging, min_free_disk_bytes=min_free_disk_bytes
+        )
+        if not preflight.get("ok"):
+            return {"ok": False, "reason": "preflight_failed", "preflight": preflight}
+        rollback_root = Path(rollback_dir) if rollback_dir else live.parent / "rollback"
+        rollback_root.mkdir(parents=True, exist_ok=True)
+        rollback_db = rollback_root / f"{live.name}.{int(_now())}.{uuid.uuid4().hex}.bak"
+        if live.exists():
+            _checkpoint_db(live)
+        copied = _copy_db_family(live, rollback_db) if live.exists() else []
+        live.parent.mkdir(parents=True, exist_ok=True)
+        incoming = live.parent / f".{live.name}.{uuid.uuid4().hex}.incoming"
+        shutil.copy2(staging, incoming)
+        validation = validate_staging_import_db(incoming)
+        if not validation.get("ok"):
+            _unlink_db_sidecars(incoming)
+            incoming.unlink(missing_ok=True)
+            return {
+                "ok": False,
+                "reason": "incoming_validation_failed",
+                "validation": validation,
+                "rollback_db": str(rollback_db) if copied else None,
+            }
+        _unlink_db_sidecars(incoming)
+        os.replace(incoming, live)
+        _unlink_db_sidecars(live)
+        return {
+            "ok": True,
+            "reason": "ok",
+            "live_db": str(live),
+            "rollback_db": str(rollback_db) if copied else None,
+            "rollback_files": copied,
+            "activated_artifact": str(staging),
+            "preflight": preflight,
+            "validation": validation,
+        }
+    finally:
+        _release_import_lockfile(live)
+
+
+def restore_import_backup(live_db: str | Path, rollback_db: str | Path) -> dict[str, Any]:
+    """Restore a backup created by activate_cold_import_bundle."""
+    live = Path(live_db)
+    rollback = Path(rollback_db)
+    if not rollback.exists():
+        return {"ok": False, "reason": "missing_rollback_db"}
+    holder = uuid.uuid4().hex
+    locked, lock_reason = _acquire_import_lockfile(live, holder=holder)
+    if not locked:
+        return {"ok": False, "reason": "import_lock_held", "detail": lock_reason}
+    try:
+        lock_conflict = _live_db_lock_conflict(live)
+        if lock_conflict:
+            return {"ok": False, "reason": "import_lock_held", "detail": lock_conflict}
+        validation = validate_staging_import_db(rollback)
+        if not validation.get("ok"):
+            return {"ok": False, "reason": "rollback_validation_failed", "validation": validation}
+        if live.exists():
+            _checkpoint_db(live)
+        live.parent.mkdir(parents=True, exist_ok=True)
+        incoming = live.parent / f".{live.name}.{uuid.uuid4().hex}.rollback"
+        shutil.copy2(rollback, incoming)
+        validation = validate_staging_import_db(incoming)
+        if not validation.get("ok"):
+            _unlink_db_sidecars(incoming)
+            incoming.unlink(missing_ok=True)
+            return {
+                "ok": False,
+                "reason": "incoming_rollback_validation_failed",
+                "validation": validation,
+            }
+        _unlink_db_sidecars(incoming)
+        os.replace(incoming, live)
+        _unlink_db_sidecars(live)
+        return {
+            "ok": True,
+            "reason": "ok",
+            "live_db": str(live),
+            "rollback_db": str(rollback),
+            "validation": validation,
+        }
+    finally:
+        _release_import_lockfile(live)
 
 
 class PrOverlapIndex:

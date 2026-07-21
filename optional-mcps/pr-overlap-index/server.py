@@ -124,6 +124,14 @@ def _call_tool(name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
                 "lease_id": None,
                 "reason": "PR overlap index is not initialized",
             })
+        if not admin_mutation:
+            return _content({
+                "repo": args.get("repo"),
+                "pr_number": args.get("pr_number"),
+                "refresh_status": "suggestion_only",
+                "lease_id": None,
+                "reason": "public MCP refresh cannot mint archive-eligible leases",
+            })
         return _content(
             refresh_pr(db, args.pop("repo"), int(args.pop("pr_number")), **args)
         )
