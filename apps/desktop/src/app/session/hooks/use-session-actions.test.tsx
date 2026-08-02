@@ -1018,9 +1018,11 @@ function BranchHarness({
 }
 
 function CurrentBranchHarness({
+  busy = false,
   onReady,
   requestGateway
 }: {
+  busy?: boolean
   onReady: (branchCurrentSession: (messageId?: string) => Promise<boolean>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
@@ -1029,7 +1031,7 @@ function CurrentBranchHarness({
   const actions = useSessionActions({
     activeSessionId: 'runtime-parent',
     activeSessionIdRef: ref<string | null>('runtime-parent'),
-    busyRef: ref(false),
+    busyRef: ref(busy),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
@@ -1143,6 +1145,90 @@ describe('stored session forks', () => {
     expect($sessionTiles.get().some(tile => tile.storedSessionId === 'branch-stored')).toBe(true)
     expect($selectedStoredSessionId.get()).toBe('stored-parent')
     expect($sessions.get().find(session => session.id === 'branch-stored')?.profile).toBe('builder')
+  })
+
+  it('forks a busy session from its latest completed assistant without interrupting the parent', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    const storedMessages = [
+      { content: 'earlier prompt', id: 1, role: 'user' as const, timestamp: 1 },
+      { content: 'earlier answer', id: 2, role: 'assistant' as const, timestamp: 2 },
+      { content: 'completed prompt', id: 3, role: 'user' as const, timestamp: 3 },
+      { content: 'completed answer', id: 4, role: 'assistant' as const, timestamp: 4 },
+      { content: 'active prompt', id: 5, role: 'user' as const, timestamp: 5 },
+      {
+        content: '',
+        id: 6,
+        role: 'assistant' as const,
+        timestamp: 6,
+        tool_calls: [{ id: 'active-tool', function: { arguments: '{}', name: 'terminal' } }]
+      },
+      {
+        content: '{"output":"still running"}',
+        id: 7,
+        role: 'tool' as const,
+        timestamp: 7,
+        tool_call_id: 'active-tool',
+        tool_name: 'terminal'
+      }
+    ]
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 7, profile: 'builder' })])
+    setSelectedStoredSessionId('stored-parent')
+    setMessages([
+      ...toChatMessages(storedMessages),
+      { id: 'streaming-assistant', parts: [{ type: 'text', text: 'partial answer' }], role: 'assistant' }
+    ])
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-parent' })
+    vi.mocked(forkSession).mockResolvedValue(
+      storedSession({ id: 'branch-stored', message_count: 4, parent_session_id: 'stored-parent' })
+    )
+
+    let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    render(
+      <CurrentBranchHarness
+        busy
+        onReady={branch => (branchCurrentSession = branch)}
+        requestGateway={requestGateway}
+      />
+    )
+    await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+    await expect(branchCurrentSession!()).resolves.toBe(true)
+
+    expect(forkSession).toHaveBeenCalledWith('stored-parent', { until_message_id: 4 }, 'builder')
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect($selectedStoredSessionId.get()).toBe('stored-parent')
+    expect($sessionTiles.get().some(tile => tile.storedSessionId === 'branch-stored')).toBe(true)
+  })
+
+  it('keeps explicit branch-from-message blocked while the parent is busy', async () => {
+    const storedMessages = [
+      { content: 'completed prompt', id: 10, role: 'user' as const, timestamp: 1 },
+      { content: 'completed answer', id: 11, role: 'assistant' as const, timestamp: 2 },
+      { content: 'active prompt', id: 12, role: 'user' as const, timestamp: 3 }
+    ]
+
+    const targetId = toChatMessages(storedMessages)[1]!.id
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 3 })])
+    setSelectedStoredSessionId('stored-parent')
+    setMessages(toChatMessages(storedMessages))
+
+    let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    render(
+      <CurrentBranchHarness
+        busy
+        onReady={branch => (branchCurrentSession = branch)}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+    await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+    await expect(branchCurrentSession!(targetId)).resolves.toBe(false)
+
+    expect(getSessionMessages).not.toHaveBeenCalled()
+    expect(forkSession).not.toHaveBeenCalled()
   })
 
   it('maps a runtime-only optimistic id by visible user/assistant ordinal', async () => {

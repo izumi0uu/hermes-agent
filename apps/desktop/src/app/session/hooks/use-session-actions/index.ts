@@ -1115,11 +1115,13 @@ export function useSessionActions({
 
   const forkStoredTranscript = useCallback(
     async ({
+      completedAssistantBeforeLatestUserOnly = false,
       messageId,
       profile,
       runtimeMessages,
       sourceSessionId
     }: {
+      completedAssistantBeforeLatestUserOnly?: boolean
       messageId?: string
       profile?: null | string
       runtimeMessages?: ChatMessage[]
@@ -1152,6 +1154,28 @@ export function useSessionActions({
         let branchMessageOrdinal = messageId
           ? branchableMessages.findIndex(message => message.id === messageId)
           : branchableMessages.length - 1
+
+        if (!messageId && completedAssistantBeforeLatestUserOnly) {
+          let latestUserOrdinal = -1
+
+          branchMessageOrdinal = -1
+
+          for (let index = branchableMessages.length - 1; index >= 0; index -= 1) {
+            if (branchableMessages[index]?.role === 'user') {
+              latestUserOrdinal = index
+
+              break
+            }
+          }
+
+          for (let index = latestUserOrdinal - 1; index >= 0; index -= 1) {
+            if (branchableMessages[index]?.role === 'assistant') {
+              branchMessageOrdinal = index
+
+              break
+            }
+          }
+        }
 
         if (messageId && branchMessageOrdinal < 0) {
           const visibleRuntimeMessages = visibleBranchableMessages(runtimeMessages ?? [])
@@ -1210,9 +1234,12 @@ export function useSessionActions({
 
   // Branch the open chat at a visible runtime bubble, resolving that bubble
   // back to an exact stored SQLite message boundary before copying anything.
+  // A command-style branch that overlaps an active turn snaps to the final
+  // assistant before the persisted active user, so live tool progress stays behind.
   const branchCurrentSession = useCallback(
     async (messageId?: string): Promise<boolean> => {
       const sourceSessionId = selectedStoredSessionIdRef.current
+      const wasBusy = busyRef.current
 
       if (!activeSessionIdRef.current || !sourceSessionId) {
         notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNeedsChat })
@@ -1220,7 +1247,7 @@ export function useSessionActions({
         return false
       }
 
-      if (busyRef.current) {
+      if (messageId && wasBusy) {
         notify({ kind: 'warning', title: copy.sessionBusy, message: copy.branchStopCurrent })
 
         return false
@@ -1228,11 +1255,12 @@ export function useSessionActions({
 
       const source = await resolveStoredSession(sourceSessionId)
 
-      if (selectedStoredSessionIdRef.current !== sourceSessionId || busyRef.current) {
+      if (selectedStoredSessionIdRef.current !== sourceSessionId || (messageId && busyRef.current)) {
         return false
       }
 
       return forkStoredTranscript({
+        completedAssistantBeforeLatestUserOnly: !messageId && (wasBusy || busyRef.current),
         messageId,
         profile: source?.profile,
         runtimeMessages: $messages.get(),
