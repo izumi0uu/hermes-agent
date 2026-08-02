@@ -25,6 +25,7 @@ import {
   $sessions,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
+  setBusy,
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModel,
@@ -1019,10 +1020,12 @@ function BranchHarness({
 
 function CurrentBranchHarness({
   busy = false,
+  busyRef,
   onReady,
   requestGateway
 }: {
   busy?: boolean
+  busyRef?: MutableRefObject<boolean>
   onReady: (branchCurrentSession: (messageId?: string) => Promise<boolean>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
@@ -1031,7 +1034,7 @@ function CurrentBranchHarness({
   const actions = useSessionActions({
     activeSessionId: 'runtime-parent',
     activeSessionIdRef: ref<string | null>('runtime-parent'),
-    busyRef: ref(busy),
+    busyRef: busyRef ?? ref(busy),
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
@@ -1101,6 +1104,7 @@ describe('stored session forks', () => {
     cleanup()
     $forkOriginNotices.set({})
     setMessages([])
+    setBusy(false)
     setSessions([])
     $sessionTiles.set([])
     setSelectedStoredSessionId(null)
@@ -1202,6 +1206,111 @@ describe('stored session forks', () => {
     expect($sessionTiles.get().some(tile => tile.storedSessionId === 'branch-stored')).toBe(true)
   })
 
+  it('fails closed when a first busy turn has no settled assistant boundary', async () => {
+    const storedMessages = [
+      { content: 'first prompt', id: 1, role: 'user' as const, timestamp: 1 },
+      {
+        content: '',
+        id: 2,
+        role: 'assistant' as const,
+        timestamp: 2,
+        tool_calls: [{ id: 'active-tool', function: { arguments: '{}', name: 'terminal' } }]
+      },
+      {
+        content: '{"output":"still running"}',
+        id: 3,
+        role: 'tool' as const,
+        timestamp: 3,
+        tool_call_id: 'active-tool',
+        tool_name: 'terminal'
+      }
+    ]
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 3 })])
+    setSelectedStoredSessionId('stored-parent')
+    setMessages(toChatMessages(storedMessages))
+    vi.mocked(getSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-parent' })
+
+    let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    render(
+      <CurrentBranchHarness
+        busy
+        onReady={branch => (branchCurrentSession = branch)}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+    await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+    await expect(branchCurrentSession!()).resolves.toBe(false)
+    expect(forkSession).not.toHaveBeenCalled()
+    expect($sessionTiles.get()).toEqual([])
+  })
+
+  it('uses the settled assistant when a busy interval occurs while loading the transcript', async () => {
+    const busyRef: MutableRefObject<boolean> = { current: false }
+    const transcript = deferred<Awaited<ReturnType<typeof getSessionMessages>>>()
+
+    const settledMessages = [
+      { content: 'completed prompt', id: 1, role: 'user' as const, timestamp: 1 },
+      { content: 'completed answer', id: 2, role: 'assistant' as const, timestamp: 2 }
+    ]
+
+    const activeMessages = [
+      ...settledMessages,
+      { content: 'overlapping prompt', id: 3, role: 'user' as const, timestamp: 3 },
+      { content: 'overlapping answer', id: 4, role: 'assistant' as const, timestamp: 4 },
+      { content: 'active prompt', id: 5, role: 'user' as const, timestamp: 5 },
+      {
+        content: '',
+        id: 6,
+        role: 'assistant' as const,
+        timestamp: 6,
+        tool_calls: [{ id: 'active-tool', function: { arguments: '{}', name: 'terminal' } }]
+      },
+      {
+        content: '{"output":"done"}',
+        id: 7,
+        role: 'tool' as const,
+        timestamp: 7,
+        tool_call_id: 'active-tool',
+        tool_name: 'terminal'
+      }
+    ]
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 2, profile: 'builder' })])
+    setSelectedStoredSessionId('stored-parent')
+    setMessages(toChatMessages(settledMessages))
+    vi.mocked(getSessionMessages).mockReturnValue(transcript.promise)
+    vi.mocked(forkSession).mockResolvedValue(
+      storedSession({ id: 'branch-stored', message_count: 2, parent_session_id: 'stored-parent' })
+    )
+
+    let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    render(
+      <CurrentBranchHarness
+        busyRef={busyRef}
+        onReady={branch => (branchCurrentSession = branch)}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+    await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+    const branchPromise = branchCurrentSession!()
+    await waitFor(() => expect(getSessionMessages).toHaveBeenCalledOnce())
+
+    act(() => {
+      busyRef.current = true
+      setBusy(true)
+      setMessages(toChatMessages(activeMessages))
+      busyRef.current = false
+      setBusy(false)
+      transcript.resolve({ messages: activeMessages, session_id: 'stored-parent' })
+    })
+
+    await expect(branchPromise).resolves.toBe(true)
+    expect(forkSession).toHaveBeenCalledWith('stored-parent', { until_message_id: 2 }, 'builder')
+  })
+
   it('keeps explicit branch-from-message blocked while the parent is busy', async () => {
     const storedMessages = [
       { content: 'completed prompt', id: 10, role: 'user' as const, timestamp: 1 },
@@ -1228,6 +1337,56 @@ describe('stored session forks', () => {
     await expect(branchCurrentSession!(targetId)).resolves.toBe(false)
 
     expect(getSessionMessages).not.toHaveBeenCalled()
+    expect(forkSession).not.toHaveBeenCalled()
+  })
+
+  it('fails an explicit branch when a busy interval occurs while loading the transcript', async () => {
+    const busyRef: MutableRefObject<boolean> = { current: false }
+    const transcript = deferred<Awaited<ReturnType<typeof getSessionMessages>>>()
+
+    const settledMessages = [
+      { content: 'completed prompt', id: 10, role: 'user' as const, timestamp: 1 },
+      { content: 'completed answer', id: 11, role: 'assistant' as const, timestamp: 2 }
+    ]
+
+    const activeMessages = [
+      ...settledMessages,
+      { content: 'active prompt', id: 12, role: 'user' as const, timestamp: 3 }
+    ]
+
+    const targetId = toChatMessages(settledMessages)[1]!.id
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 2 })])
+    setSelectedStoredSessionId('stored-parent')
+    setMessages(toChatMessages(settledMessages))
+    vi.mocked(getSessionMessages).mockReturnValue(transcript.promise)
+    vi.mocked(forkSession).mockResolvedValue(
+      storedSession({ id: 'branch-stored', message_count: 2, parent_session_id: 'stored-parent' })
+    )
+
+    let branchCurrentSession: ((messageId?: string) => Promise<boolean>) | null = null
+    render(
+      <CurrentBranchHarness
+        busyRef={busyRef}
+        onReady={branch => (branchCurrentSession = branch)}
+        requestGateway={async () => ({}) as never}
+      />
+    )
+    await waitFor(() => expect(branchCurrentSession).not.toBeNull())
+
+    const branchPromise = branchCurrentSession!(targetId)
+    await waitFor(() => expect(getSessionMessages).toHaveBeenCalledOnce())
+
+    act(() => {
+      busyRef.current = true
+      setBusy(true)
+      setMessages(toChatMessages(activeMessages))
+      busyRef.current = false
+      setBusy(false)
+      transcript.resolve({ messages: activeMessages, session_id: 'stored-parent' })
+    })
+
+    await expect(branchPromise).resolves.toBe(false)
     expect(forkSession).not.toHaveBeenCalled()
   })
 
