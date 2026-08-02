@@ -28,6 +28,7 @@ import {
 } from '@/store/projects'
 import {
   $activeSessionStoredIdRotation,
+  $busy,
   $currentCwd,
   $currentFastMode,
   $currentModel,
@@ -146,6 +147,25 @@ function visibleBranchableMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages.filter(message => !message.hidden && (message.role === 'assistant' || message.role === 'user'))
 }
 
+function settledAssistantMessageIdAtInvocation(messages: ChatMessage[], busy: boolean): string | undefined {
+  const visibleMessages = visibleBranchableMessages(messages)
+  let searchFrom = visibleMessages.length - 1
+
+  if (busy) {
+    const latestUserOrdinal = visibleMessages.findLastIndex(message => message.role === 'user')
+
+    searchFrom = latestUserOrdinal - 1
+  }
+
+  for (let index = searchFrom; index >= 0; index -= 1) {
+    if (visibleMessages[index]?.role === 'assistant') {
+      return visibleMessages[index]?.id
+    }
+  }
+
+  return undefined
+}
+
 function upsertForkedSession(session: SessionInfo) {
   setSessions(previous => [session, ...previous.filter(existing => existing.id !== session.id)])
 }
@@ -233,7 +253,19 @@ export function useSessionActions({
 }: SessionActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
+  const busyEpochRef = useRef(0)
   const resumeRequestRef = useRef(0)
+
+  // A boolean cannot reveal a busy interval that starts and settles while an
+  // async branch operation is awaiting profile/transcript I/O. Keep a local
+  // monotonic edge counter so those transient intervals remain observable.
+  useEffect(
+    () =>
+      $busy.listen(() => {
+        busyEpochRef.current += 1
+      }),
+    []
+  )
 
   // Follow auto-compression's stored-id rotation only while the exact runtime,
   // selection, and route intent still belong to the rotating conversation.
@@ -1117,12 +1149,16 @@ export function useSessionActions({
     async ({
       messageId,
       profile,
+      resolveBoundaryMode,
       runtimeMessages,
+      settledAssistantMessageId,
       sourceSessionId
     }: {
       messageId?: string
       profile?: null | string
+      resolveBoundaryMode?: () => 'abort' | 'latest' | 'settled-assistant'
       runtimeMessages?: ChatMessage[]
+      settledAssistantMessageId?: string
       sourceSessionId: string
     }): Promise<boolean> => {
       creatingSessionRef.current = true
@@ -1130,6 +1166,12 @@ export function useSessionActions({
       try {
         await ensureGatewayProfile(profile)
         const stored = await getSessionMessages(sourceSessionId, profile)
+        const boundaryMode = resolveBoundaryMode?.() ?? 'latest'
+
+        if (boundaryMode === 'abort') {
+          return false
+        }
+
         const { lastSourceMessageIdByChatId, messages } = toChatMessagesWithSourceMap(stored.messages)
         const branchableMessages = visibleBranchableMessages(messages)
 
@@ -1149,13 +1191,18 @@ export function useSessionActions({
           return false
         }
 
-        let branchMessageOrdinal = messageId
-          ? branchableMessages.findIndex(message => message.id === messageId)
-          : branchableMessages.length - 1
+        const boundaryMessageId =
+          messageId ?? (boundaryMode === 'settled-assistant' ? settledAssistantMessageId : undefined)
 
-        if (messageId && branchMessageOrdinal < 0) {
+        let branchMessageOrdinal = boundaryMessageId
+          ? branchableMessages.findIndex(message => message.id === boundaryMessageId)
+          : boundaryMode === 'settled-assistant'
+            ? -1
+            : branchableMessages.length - 1
+
+        if (boundaryMessageId && branchMessageOrdinal < 0) {
           const visibleRuntimeMessages = visibleBranchableMessages(runtimeMessages ?? [])
-          const runtimeOrdinal = visibleRuntimeMessages.findIndex(message => message.id === messageId)
+          const runtimeOrdinal = visibleRuntimeMessages.findIndex(message => message.id === boundaryMessageId)
 
           if (
             runtimeOrdinal >= 0 &&
@@ -1210,17 +1257,24 @@ export function useSessionActions({
 
   // Branch the open chat at a visible runtime bubble, resolving that bubble
   // back to an exact stored SQLite message boundary before copying anything.
+  // A command-style branch freezes the settled assistant visible at invocation
+  // whenever an active turn overlaps resolution, so later tool progress stays behind.
   const branchCurrentSession = useCallback(
     async (messageId?: string): Promise<boolean> => {
+      const activeSessionIdAtInvocation = activeSessionIdRef.current
+      const busyEpochAtInvocation = busyEpochRef.current
       const sourceSessionId = selectedStoredSessionIdRef.current
+      const wasBusy = busyRef.current
+      const runtimeMessagesAtInvocation = $messages.get()
+      const settledAssistantMessageId = settledAssistantMessageIdAtInvocation(runtimeMessagesAtInvocation, wasBusy)
 
-      if (!activeSessionIdRef.current || !sourceSessionId) {
+      if (!activeSessionIdAtInvocation || !sourceSessionId) {
         notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNeedsChat })
 
         return false
       }
 
-      if (busyRef.current) {
+      if (messageId && wasBusy) {
         notify({ kind: 'warning', title: copy.sessionBusy, message: copy.branchStopCurrent })
 
         return false
@@ -1228,14 +1282,36 @@ export function useSessionActions({
 
       const source = await resolveStoredSession(sourceSessionId)
 
-      if (selectedStoredSessionIdRef.current !== sourceSessionId || busyRef.current) {
+      if (
+        activeSessionIdRef.current !== activeSessionIdAtInvocation ||
+        selectedStoredSessionIdRef.current !== sourceSessionId ||
+        (messageId && busyRef.current)
+      ) {
         return false
       }
+
+      const operationOverlappedTurn = () =>
+        wasBusy || busyRef.current || busyEpochRef.current !== busyEpochAtInvocation
 
       return forkStoredTranscript({
         messageId,
         profile: source?.profile,
-        runtimeMessages: $messages.get(),
+        resolveBoundaryMode: () => {
+          if (
+            activeSessionIdRef.current !== activeSessionIdAtInvocation ||
+            selectedStoredSessionIdRef.current !== sourceSessionId
+          ) {
+            return 'abort'
+          }
+
+          if (messageId) {
+            return operationOverlappedTurn() ? 'abort' : 'latest'
+          }
+
+          return operationOverlappedTurn() ? 'settled-assistant' : 'latest'
+        },
+        runtimeMessages: runtimeMessagesAtInvocation,
+        settledAssistantMessageId,
         sourceSessionId: source?.id ?? sourceSessionId
       })
     },
